@@ -1691,7 +1691,7 @@ class CrossValidateAgent(AgentNode):
 # ===== MaterialKnowledgeExtractionAgent（Task 2：材料-性能-合成三元组）=====
 
 class MaterialExtractItem(BaseModel):
-    """材料实体抽取 schema 条目。"""
+    """材料实体抽取 schema 条目（多维性质画像抽取）。"""
 
     name: str = Field(description="材料名称/化学式（规范化，如 CH3NH3PbI3、MAPbI3）")
     formula: str = Field(default="", description="化学式（若可解析）")
@@ -1700,21 +1700,36 @@ class MaterialExtractItem(BaseModel):
     lattice_parameters: str = Field(default="", description="晶格参数（如 a=8.85 Å）")
     symmetry: str = Field(default="", description="对称性")
     composition: str = Field(default="", description="组成/掺杂（如 Cs0.05FA0.95PbI3、5% Mn-doped）")
-    # 性能指标（可能多条，需与材料绑定）
+    # ===== 深度分析扩展：基础结构性质 =====
+    material_type: str = Field(default="", description="材料类型（半导体/热电/钙钛矿/陶瓷/金属/高分子…）")
+    crystal_system: str = Field(default="", description="晶系（cubic/tetragonal/orthorhombic/hexagonal/monoclinic/triclinic）")
+    morphology: str = Field(default="", description="单晶/多晶/非晶")
+    phase_composition: str = Field(default="", description="相组成（是否多相）")
+    # 性能指标（可能多条，需与材料绑定；覆盖电子/热/光/力/化学稳定性等多维度）
     properties: list[dict] = Field(
         default_factory=list,
         description=(
-            "[{property_name, property_name_cn, value, value_num, unit, condition}], "
+            "[{property_name, property_name_cn, value, value_num, unit, condition, "
+            "data_type, test_temperature}], "
             "property_name 如 ZT / power_factor / thermal_conductivity / "
-            "electrical_conductivity / seebeck_coefficient"
+            "electrical_conductivity / seebeck_coefficient / band_gap / hardness / "
+            "absorption_coefficient / decomposition_temperature 等；"
+            "data_type ∈ experimental/theoretical（实验值或理论值，不明则留空）；"
+            "test_temperature 为测试温度（如 300 K）。"
+            "只抽取文本明确提到的信息，不要臆造数值。"
         ),
     )
-    # 合成条件（可能多条）
+    # 合成条件（可能多条；只抽取文本明确给出的参数，不要为补齐字段而编造）
     synthesis: list[dict] = Field(
         default_factory=list,
         description=(
-            "[{method, precursors, temperature, pressure, atmosphere, duration, steps}], "
-            "method 如 solid-state reaction / CVD / sol-gel / hot-pressing"
+            "[{method, precursors, precursor_ratio, solvent, temperature, pressure, "
+            "atmosphere, duration, heating_rate, ph, stirring, aging_time, "
+            "drying_temperature, calcination_temperature, calcination_time, "
+            "cooling_method, post_treatment, equipment, yield, phase_purity, "
+            "particle_size, steps}], "
+            "method 如 solid-state reaction / CVD / sol-gel / hot-pressing / hydrothermal。"
+            "未在文本中出现的字段留空，严禁编造实验参数。"
         ),
     )
 
@@ -1790,6 +1805,14 @@ class MaterialKnowledgeExtractionAgent(AgentNode):
                     lattice_parameters=m.get("lattice_parameters", ""),
                     symmetry=m.get("symmetry", ""),
                     composition=m.get("composition", ""),
+                    # 深度分析扩展：基础结构性质
+                    material_type=m.get("material_type", ""),
+                    crystal_system=m.get("crystal_system", ""),
+                    morphology=m.get("morphology", ""),
+                    phase_composition=m.get("phase_composition", ""),
+                    is_multiphase=bool(m.get("is_multiphase", False)),
+                    element_composition=m.get("element_composition", ""),
+                    element_ratio=m.get("element_ratio", ""),
                     paper_id=m.get("paper_id"),
                     paper_title=m.get("paper_title", ""),
                     norm_name=norm,
@@ -1825,6 +1848,10 @@ class MaterialKnowledgeExtractionAgent(AgentNode):
                     value_num=value_num,
                     unit=p.get("unit") or "",
                     condition=p.get("condition") or "",
+                    # 深度分析扩展：数据类型/测试温度/来源（证据等级由 annotate 规则回填）
+                    data_type=p.get("data_type") or "",
+                    test_temperature=p.get("test_temperature") or "",
+                    source_type="paper" if p.get("paper_id") else "",
                     paper_id=p.get("paper_id"),
                     paper_title=p.get("paper_title") or "",
                     confidence=float(p.get("confidence", 0.0) or 0.0),
@@ -1844,6 +1871,10 @@ class MaterialKnowledgeExtractionAgent(AgentNode):
                 _raw_pre = s.get("precursors", []) or []
                 if isinstance(_raw_pre, str):
                     _raw_pre = [_raw_pre]
+                # equipment 同理统一转 list
+                _raw_equip = s.get("equipment", []) or []
+                if isinstance(_raw_equip, str):
+                    _raw_equip = [_raw_equip]
                 # steps 可能是 list，统一转字符串
                 _raw_steps = s.get("steps", "") or ""
                 if isinstance(_raw_steps, list):
@@ -1858,6 +1889,23 @@ class MaterialKnowledgeExtractionAgent(AgentNode):
                     atmosphere=s.get("atmosphere") or "",
                     duration=s.get("duration") or "",
                     steps=_raw_steps,
+                    # 深度分析扩展：完整实验参数
+                    precursor_ratio=s.get("precursor_ratio") or "",
+                    solvent=s.get("solvent") or "",
+                    solvent_ratio=s.get("solvent_ratio") or "",
+                    heating_rate=s.get("heating_rate") or "",
+                    ph=s.get("ph") or "",
+                    stirring=s.get("stirring") or "",
+                    aging_time=s.get("aging_time") or "",
+                    drying_temperature=s.get("drying_temperature") or "",
+                    calcination_temperature=s.get("calcination_temperature") or "",
+                    calcination_time=s.get("calcination_time") or "",
+                    cooling_method=s.get("cooling_method") or "",
+                    post_treatment=s.get("post_treatment") or "",
+                    equipment=list(_raw_equip),
+                    yield_=s.get("yield") or "",
+                    phase_purity=s.get("phase_purity") or "",
+                    particle_size=s.get("particle_size") or "",
                     paper_id=s.get("paper_id"),
                     paper_title=s.get("paper_title", ""),
                     confidence=float(s.get("confidence", 0.0) or 0.0),
@@ -1920,11 +1968,16 @@ class MaterialKnowledgeExtractionAgent(AgentNode):
                     task_type=self.task_type,
                     output_schema=MaterialExtractSchema,
                     system=(
-                        "你是材料科学知识抽取专家。从论文标题与摘要中抽取结构化材料知识：\n"
-                        "1. 材料：化学式/名称、晶体结构、空间群、晶格参数、对称性、组成掺杂\n"
-                        "2. 性能：ZT、功率因子、热导率、电导率、Seebeck 系数等（带数值/条件）\n"
-                        "3. 合成：工艺方法、前驱体、温度、压力、气氛、时间、步骤\n"
-                        "只抽取文本中明确提到的信息，不要臆造。每篇论文列出研究的主要材料。"
+                        "你是材料科学知识抽取专家。从论文标题与摘要中抽取结构化材料知识（多维性质画像）：\n"
+                        "1. 材料：化学式/名称、晶体结构、空间群、晶格参数、对称性、组成掺杂、"
+                        "材料类型、晶系、单晶/多晶/非晶、相组成\n"
+                        "2. 性能：覆盖电子（带隙/电导率/载流子/迁移率/Seebeck）、热（热导率/比热/熔点）、"
+                        "光（吸收系数/折射率）、力学（杨氏模量/硬度）、化学稳定性（分解温度/稳定性）等维度；"
+                        "带数值/单位/条件，并标注 data_type（experimental/theoretical）与 test_temperature\n"
+                        "3. 合成：工艺方法、前驱体及其比例、溶剂、温度、压力、气氛、时间、升温速率、"
+                        "pH、搅拌、煅烧/退火温度、冷却方式、设备、产率、相纯度、粒径、步骤\n"
+                        "硬约束：只抽取文本明确提到的信息，绝不臆造数值或实验参数；"
+                        "未出现的字段留空。每篇论文列出研究的主要材料。"
                     ),
                     prompt=(
                         f"论文标题：{title}\n"
@@ -1940,6 +1993,11 @@ class MaterialKnowledgeExtractionAgent(AgentNode):
                         "lattice_parameters": item.lattice_parameters,
                         "symmetry": item.symmetry,
                         "composition": item.composition,
+                        "material_type": item.material_type,
+                        "crystal_system": item.crystal_system,
+                        "morphology": item.morphology,
+                        "phase_composition": item.phase_composition,
+                        "is_multiphase": item.phase_composition != "",
                         "paper_id": p.paper_id,
                         "paper_title": title,
                         "confidence": 0.8,
@@ -1955,6 +2013,8 @@ class MaterialKnowledgeExtractionAgent(AgentNode):
                             "value_num": prop.get("value_num"),
                             "unit": prop.get("unit", ""),
                             "condition": prop.get("condition", ""),
+                            "data_type": prop.get("data_type", ""),
+                            "test_temperature": prop.get("test_temperature", ""),
                             "paper_id": p.paper_id,
                             "paper_title": title,
                             "confidence": 0.8,
@@ -1965,10 +2025,25 @@ class MaterialKnowledgeExtractionAgent(AgentNode):
                             "material_name": item.name,
                             "method": syn.get("method", ""),
                             "precursors": syn.get("precursors", []),
+                            "precursor_ratio": syn.get("precursor_ratio", ""),
+                            "solvent": syn.get("solvent", ""),
                             "temperature": syn.get("temperature", ""),
                             "pressure": syn.get("pressure", ""),
                             "atmosphere": syn.get("atmosphere", ""),
                             "duration": syn.get("duration", ""),
+                            "heating_rate": syn.get("heating_rate", ""),
+                            "ph": syn.get("ph", ""),
+                            "stirring": syn.get("stirring", ""),
+                            "aging_time": syn.get("aging_time", ""),
+                            "drying_temperature": syn.get("drying_temperature", ""),
+                            "calcination_temperature": syn.get("calcination_temperature", ""),
+                            "calcination_time": syn.get("calcination_time", ""),
+                            "cooling_method": syn.get("cooling_method", ""),
+                            "post_treatment": syn.get("post_treatment", ""),
+                            "equipment": syn.get("equipment", []),
+                            "yield": syn.get("yield", ""),
+                            "phase_purity": syn.get("phase_purity", ""),
+                            "particle_size": syn.get("particle_size", ""),
                             "steps": syn.get("steps", ""),
                             "paper_id": p.paper_id,
                             "paper_title": title,

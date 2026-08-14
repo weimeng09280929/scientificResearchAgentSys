@@ -245,6 +245,8 @@ class ProjectState:
     next_nodes: list[str] = field(default_factory=list)
     notes: list[dict] = field(default_factory=list)
     recommendation: str = ""
+    # 方法改进建议（实验成败评估 advice，逐条可执行；experiment_failed 后展示）
+    advice: list[dict] = field(default_factory=list)
     # 路线 A：构效关系发现产出（从 discovery 子图 context 收集）
     discovery: dict = field(default_factory=dict)
     # 方向推荐产出（从 topic_discovery 子图收集）
@@ -421,6 +423,8 @@ def _run_pipeline_thread(project_id: str, topic: str, resume: bool, force_writin
         state.status = result.status
         state.summary = result.summary
         state.recommendation = result.recommendation
+        # 方法改进建议：从实验成败评估 outcome.advice 透传给前端展示
+        state.advice = (result.experiment_outcome or {}).get("advice", []) or []
         state.node_history = result.node_history or []
         state.current_node = None
         state.next_nodes = []
@@ -461,6 +465,8 @@ def _run_discovery_thread(project_id: str, topic: str, resume: bool) -> None:
         state.status = result.status
         state.summary = result.summary
         state.recommendation = result.recommendation
+        # 方法改进建议：从实验成败评估 outcome.advice 透传给前端展示
+        state.advice = (result.experiment_outcome or {}).get("advice", []) or []
         state.node_history = result.node_history or []
         state.current_node = None
         state.next_nodes = []
@@ -762,6 +768,7 @@ def get_status(project_id: str) -> dict:
         "status": state.status,
         "summary": state.summary,
         "recommendation": state.recommendation,
+        "advice": state.advice,
         "error": state.error,
         "current_stage": current_stage,
         "stage_statuses": stage_statuses,
@@ -1086,9 +1093,18 @@ def list_materials(project_id: str) -> dict:
                 "symbol": norm["symbol"],
                 "unit": norm["unit"],
                 "category": norm["category"],
+                "dimension": norm.get("dimension", "other"),
                 "value": p.value,
                 "value_num": p.value_num,
                 "condition": p.condition,
+                # 深度分析字段（机制/证据/数据类型）
+                "mechanism": p.mechanism,
+                "impact_on_target": p.impact_on_target,
+                "evidence_level": p.evidence_level or "E",
+                "evidence_count": p.evidence_count,
+                "data_type": p.data_type,
+                "test_temperature": p.test_temperature,
+                "source_type": p.source_type,
                 "paper_title": p.paper_title,
                 "confidence": p.confidence,
                 "source_snippet": p.source_snippet,
@@ -1107,6 +1123,27 @@ def list_materials(project_id: str) -> dict:
                 "atmosphere": s.atmosphere,
                 "duration": s.duration,
                 "steps": s.steps,
+                # 深度分析字段（完整实验参数 + 分步流程 + 风险 + 可复现性 + 证据）
+                "precursor_ratio": s.precursor_ratio,
+                "solvent": s.solvent,
+                "heating_rate": s.heating_rate,
+                "ph": s.ph,
+                "stirring": s.stirring,
+                "aging_time": s.aging_time,
+                "drying_temperature": s.drying_temperature,
+                "calcination_temperature": s.calcination_temperature,
+                "calcination_time": s.calcination_time,
+                "cooling_method": s.cooling_method,
+                "post_treatment": s.post_treatment,
+                "equipment": s.equipment,
+                "yield": s.yield_,
+                "phase_purity": s.phase_purity,
+                "particle_size": s.particle_size,
+                "workflow_steps": s.workflow_steps,
+                "risks": s.risks,
+                "reproducibility_score": s.reproducibility_score,
+                "evidence_level": s.evidence_level or "E",
+                "evidence_count": s.evidence_count,
                 "paper_title": s.paper_title,
                 "confidence": s.confidence,
                 "source_snippet": s.source_snippet,
@@ -1200,6 +1237,70 @@ def list_materials(project_id: str) -> dict:
             "material_categories": material_cat_counter,
         },
     }
+
+
+def _infer_target(props: list) -> str:
+    """从项目内性质数据推断研究目标性能（默认 ZT）。
+
+    统计 performance 维度性质（ZT/功率因子/转换效率）出现频率，取最高者；
+    无性能数据时默认 ZT（热电为项目主场景）。
+    """
+    from core.knowledge.normalize import normalize_property
+
+    counter: dict[str, int] = {}
+    for p in props:
+        norm = normalize_property(getattr(p, "property_name", ""), getattr(p, "property_name_cn", ""))
+        if norm.get("dimension") == "performance":
+            key = norm["key"]
+            counter[key] = counter.get(key, 0) + 1
+    if not counter:
+        return "ZT"
+    return max(counter, key=counter.get)
+
+
+@app.get("/api/projects/{project_id}/materials/{material_id}/profile")
+def get_material_profile(project_id: str, material_id: str) -> dict:
+    """获取材料深度分析画像（多维性质 → 机制 → 目标性能 → 对比 → 候选排序 → 合成路线）。
+
+    这是「材料选择 + 性质判断 + 合成方案设计 + 实验决策」的深度分析入口：
+    - 性质按六大维度分组（结构/电子/热/光/力/化学稳定性）
+    - 性质 → 机制 → 目标性能 关系解释（规则引擎 + LLM 增强）
+    - 目标性能因果拆解（如 ZT = S²σT/κ）
+    - 材料横向对比矩阵（单位统一 + 范围显示 + 证据等级）
+    - 材料候选排序（六维加权评分，可溯源）
+    - 合成路线对比 + 推荐 + 风险 + 可复现性评分
+
+    确定性规则引擎兜底，不编造数据；缺失值明确标记 missing。
+    """
+    from core.knowledge.material_analysis import build_profile
+    from core.knowledge.normalize import categorize_material
+
+    _require_project(project_id)
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    mat = store.get_material(material_id)
+    if mat is None:
+        raise HTTPException(status_code=404, detail="材料不存在")
+
+    # 该材料的性质 + 合成
+    props = store.list_material_properties(material_id=material_id)
+    syns = store.list_material_synthesis(material_id=material_id)
+
+    # 全体材料（用于对比矩阵 + 候选排序）
+    all_materials = store.list_materials(limit=500)
+    all_props = store.list_material_properties()
+    all_syns = store.list_material_synthesis()
+    props_by_mat: dict[str, list] = {}
+    for p in all_props:
+        props_by_mat.setdefault(p.material_id, []).append(p)
+    syns_by_mat: dict[str, list] = {}
+    for s in all_syns:
+        syns_by_mat.setdefault(s.material_id, []).append(s)
+
+    target = _infer_target(all_props)
+    profile = build_profile(mat, props, syns, all_materials, props_by_mat, syns_by_mat, target)
+    profile["category"] = categorize_material(mat.name, mat.formula)
+    profile["target"] = target
+    return profile
 
 
 @app.get("/api/projects/{project_id}/gaps")
@@ -2436,6 +2537,8 @@ def get_dashboard(project_id: str) -> dict:
         "topic": state.topic,
         "status": state.status,
         "summary": state.summary,
+        "recommendation": state.recommendation,
+        "advice": state.advice,
         "current_stage": current_stage,
         "stage_statuses": stage_statuses,
         "counts": counts,
@@ -2786,6 +2889,33 @@ def _md_to_docx_response(md_content: str, base_filename: str) -> Response:
     )
 
 
+def _pdf_safe_text(text: str, max_chars: int = 100) -> str:
+    """pdf 文本安全化：去除不可打印控制符，超长行按字符截断；
+    连续无空格长串（URL / 代码）按 40 字符插空格，防止 fpdf2 抛
+    'Not enough horizontal space to render a single character'。"""
+    if text is None:
+        return ""
+    # 保留常见标点与中文，剥离控制字符（\x00-\x1f 等）
+    safe = "".join(ch for ch in text if ch >= " " or ch in "\n\r\t")
+    # 给超过 40 字符的无空格连续串插入空格，便于 word wrap
+    out = []
+    span = 0
+    for ch in safe:
+        if ch.isspace():
+            span = 0
+            out.append(ch)
+            continue
+        span += 1
+        if span > 40:
+            out.append(" ")
+            span = 1
+        out.append(ch)
+    safe = "".join(out)
+    if len(safe) > max_chars:
+        safe = safe[:max_chars] + "…"
+    return safe
+
+
 def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
     """将 Markdown 转为 PDF 并返回下载响应。
 
@@ -2793,23 +2923,27 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
     """
     import io
     from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
 
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=20)
     pdf.add_page()
 
-    # 注册中文字体（Windows 系统字体）
+    # 注册中文字体（Windows 系统字体）。
+    # 注意：fpdf2 >= 2.7 已弃用 uni=True 参数，传入反而触发 TTC 中文渲染 bug
+    # （multi_cell 抛 "Not enough horizontal space to render a single character"），
+    # 故一律不传 uni；优先 simhei.ttf（单 TTF，最稳），再试 msyh.ttc / simsun.ttc。
     font_name = "chinese"
     font_paths = [
-        "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simsun.ttc",
     ]
     font_loaded = False
     for fp in font_paths:
         if os.path.exists(fp):
             try:
-                pdf.add_font(font_name, "", fp, uni=True)
+                pdf.add_font(font_name, "", fp)
                 font_loaded = True
                 break
             except Exception:
@@ -2829,35 +2963,35 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
             continue
         if in_code_block:
             pdf.set_font(font_name, size=8)
-            # 截断超长行
-            safe = stripped[:120] if len(stripped) > 120 else stripped
-            pdf.multi_cell(0, 5, safe)
+            # 代码块：超长行按 80 字符截断 + 字符换行（wrapmode=CHAR），
+            # 防止 fpdf2 遇到超宽单词抛 "Not enough horizontal space"
+            pdf.multi_cell(0, 5, _pdf_safe_text(stripped, 80), wrapmode="CHAR", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
             continue
 
         if stripped.startswith("### "):
             pdf.set_font(font_name, size=13)
             pdf.ln(3)
-            pdf.multi_cell(0, 7, stripped[4:])
+            pdf.multi_cell(0, 7, _pdf_safe_text(stripped[4:]), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
         elif stripped.startswith("## "):
             pdf.set_font(font_name, size=15)
             pdf.ln(5)
-            pdf.multi_cell(0, 8, stripped[3:])
+            pdf.multi_cell(0, 8, _pdf_safe_text(stripped[3:]), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
         elif stripped.startswith("# "):
             pdf.set_font(font_name, size=18)
             pdf.ln(8)
-            pdf.multi_cell(0, 10, stripped[2:])
+            pdf.multi_cell(0, 10, _pdf_safe_text(stripped[2:]), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
         elif stripped.startswith("---"):
             pdf.ln(3)
-            pdf.multi_cell(0, 5, "=" * 60)
+            pdf.multi_cell(0, 5, "=" * 60, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.ln(2)
         elif stripped.startswith("- ") or stripped.startswith("* "):
-            pdf.multi_cell(0, 6, f"  • {stripped[2:]}")
+            pdf.multi_cell(0, 6, f"  \u2013 {_pdf_safe_text(stripped[2:])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         elif stripped:
-            pdf.multi_cell(0, 6, stripped)
+            pdf.multi_cell(0, 6, _pdf_safe_text(stripped), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         else:
             pdf.ln(3)
 
