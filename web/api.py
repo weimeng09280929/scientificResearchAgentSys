@@ -4,23 +4,28 @@
     python -m web.api
     # 或：uvicorn web.api:app --host 0.0.0.0 --port 8000
 
-提供 REST 接口供前端单页应用调用，所有项目状态存内存（Demo 用，不持久化）。
+提供 REST 接口供前端单页应用调用。研究身份、材料与执行上下文持久化；
+运行中的线程和人工等待桥仍属于单个服务进程，不支持多 worker 共享任务。
 Pipeline 在独立线程中异步执行，人工节点通过 HumanCallbackBridge 桥接到 REST 接口。
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import threading
 import uuid
+import contextvars
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from fastapi.responses import JSONResponse
 from typing import Any, Callable, Optional
-from typing import Any, Optional
 
 # 确保项目根在 sys.path（python -m web.api 已保证，但直接运行脚本时需补充）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -32,11 +37,17 @@ from runtime.cli import _load_env  # noqa: E402
 
 _load_env()
 
+# 本地回环永远直连：把回环地址并入进程级 NO_PROXY（保留既有条目，
+# 不清空、不全局禁用代理）。避免本机模型网关 / 本服务自调用被代理劫持。
+from core.tools.http import ensure_loopback_direct  # noqa: E402
+
+ensure_loopback_direct()
+
 
 def _set_global_seed() -> None:
-    """设置全局随机种子，保证构效关系搜索（MCTS 等）结果可复现。
+    """设置全局随机种子，保证搜索类节点（MCTS 等）结果可复现。
 
-    赛题复现审核要求：随机种子与复现说明。
+    复现要求：随机种子与复现说明。
     默认 seed=42，可用环境变量 SRA_SEED 覆盖。
     注意：LLM 输出本身有随机性，本种子保证算法内随机操作（节点扩展、
     tie-breaking、采样扰动等）在相同 LLM 输入下可复现。
@@ -102,11 +113,27 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import FileResponse, Response  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
+from pydantic import Field, ValidationError  # noqa: E402
+from core.experiment_results import SubmittedResult  # noqa: E402
+from core.project_archive import archive_project_directories  # noqa: E402
+from core.project_catalog import project_metadata, project_rows, project_page, recent_conversations, has_active_chat  # noqa: E402
+from typing import Annotated
+from fastapi import Query
+from fastapi import Request
+from pydantic import Field as AuthField
+from core.local_accounts import AccountStore, SESSION_SECONDS, MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH
+from core.resource_limits import RESOURCES, ACTOR, CapacityError, heavy_operation
+import hmac
 
 from core.config import get_config  # noqa: E402
-from core.knowledge import KnowledgeStore  # noqa: E402
+from core.product_boundary import inspect_boundary, public_boundary, historical_stage, NOTICE  # noqa: E402
+from core.document_math import MATH_DOCUMENT_GUIDE, split_table_row  # noqa: E402
+from core.research_scope import normalize_public_domain, is_public_domain  # noqa: E402
+from core.knowledge import KnowledgeStore, ExperimentStatus  # noqa: E402
+from core.llm.base import strip_think_tags  # noqa: E402
+from core.llm import LLMRegistry  # noqa: E402
 from core.orchestration.node import HumanRequest, HumanResponse  # noqa: E402
-from core.state.lifecycle import LifecycleStage  # noqa: E402
+from core.state.lifecycle import LifecycleStage, StageStatus  # noqa: E402
 from core.state.session import ProjectSession  # noqa: E402
 from core.tools.journal_quality import enrich_paper_quality, build_pdf_url  # noqa: E402
 from core.tools.doi_resolve import find_open_access_pdf, resolve_doi_by_title  # noqa: E402
@@ -126,11 +153,14 @@ from stages.common import RESEARCH_SEARCH_PREFS  # noqa: E402
 
 class CreateProjectRequest(BaseModel):
     topic: str
+    # 首版只开放计算机范围；空值兼容旧客户端，归入 computer_science。
+    domain: str = ""
 
 
 class TopicDiscoveryRequest(BaseModel):
     """方向推荐请求。"""
     interest: str
+    domain: str = ""
 class RunProjectRequest(BaseModel):
     force_writing: bool = False
 
@@ -139,10 +169,16 @@ class NoteRequest(BaseModel):
     text: str
 
 
+class BatchDeleteProjectsRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    project_ids: list[str] = Field(min_length=1, max_length=200)
+
+
 class HumanResponseRequest(BaseModel):
     action: str = "continue"  # continue / abort / rollback
     text: Optional[str] = None
     selected_option: Optional[str] = None
+    expected_node_id: Optional[str] = None
     # 检索偏好（可选）：年份区间 + 期刊关键词，在确认检索方向节点提交
     search_prefs: Optional[dict] = None
 
@@ -187,16 +223,15 @@ class HumanCallbackBridge:
             # 通知外部（工作线程）项目进入人工等待状态
             if on_pending is not None:
                 on_pending()
-            # 阻塞直到 REST 接口提交响应或超时
-            triggered = event.wait(timeout=3600)
-            # 收到响应/超时后恢复 running
+            # 仅用户明确提交才结束等待；长时间阅读/离开页面不等于中止。
+            event.wait()
             if on_resume is not None:
                 on_resume()
             with self._lock:
                 resp = self._responses.pop(project_id, None)
                 self._pending.pop(project_id, None)
                 self._events.pop(project_id, None)
-            if not triggered or resp is None:
+            if resp is None:
                 return HumanResponse(action="abort")
             return resp
 
@@ -234,6 +269,10 @@ class ProjectState:
     project_id: str
     topic: str
     created_at: str
+    # 研究领域（领域自适应）：决定各阶段 prompt 中「抽取什么对象 /
+    # 关注什么指标 / 记录什么方法」的语义，材料只是可选值之一
+    domain: str = ""
+    display_name: str = ""  # Presentation only; never replaces the research topic.
     status: str = "created"  # created / running / pending_human / completed / failed / aborted
     summary: str = ""
     last_result: Optional[PipelineResult] = None
@@ -247,12 +286,11 @@ class ProjectState:
     recommendation: str = ""
     # 方法改进建议（实验成败评估 advice，逐条可执行；experiment_failed 后展示）
     advice: list[dict] = field(default_factory=list)
-    # 路线 A：构效关系发现产出（从 discovery 子图 context 收集）
+    # 关系发现子流程产出（从 discovery 子图 context 收集，可选）
     discovery: dict = field(default_factory=dict)
     # 方向推荐产出（从 topic_discovery 子图收集）
     topic_discovery: dict = field(default_factory=dict)
     # 当前运行模式：pipeline / discovery / topic_discovery
-    # 当前运行模式：pipeline / discovery
     run_mode: str = ""
     # 用户检索偏好（论文抓取范围）：{year_min, year_max, venue_hint}
     search_prefs: dict = field(default_factory=dict)
@@ -262,9 +300,34 @@ class ProjectState:
 
 logger = logging.getLogger("sra.api")
 _CONFIG = get_config()
+_AUTH_MODE = os.environ.get("SRA_AUTH_MODE", "accounts").strip().lower()
+if _AUTH_MODE not in {"local", "accounts"}:
+    raise RuntimeError("SRA_AUTH_MODE 必须为 local 或 accounts")
+_ACCOUNT_STORE = AccountStore(Path(os.environ.get("SRA_ACCOUNTS_DB") or (_CONFIG.paths.projects / ".local-accounts.db")))
+if _AUTH_MODE == "accounts" and not _ACCOUNT_STORE.path.is_file():
+    raise RuntimeError("账号模式的账号库尚未初始化；请先运行管理命令")
+if _AUTH_MODE == "accounts":
+    _ACCOUNT_STORE.check_schema()
+_CURRENT_USER: contextvars.ContextVar[str | None] = contextvars.ContextVar("sra_user", default=None)
+
+
+def _active_user() -> str:
+    user = _CURRENT_USER.get()
+    if _AUTH_MODE == "accounts" and user is None:
+        raise HTTPException(401, "请重新登录")
+    return user or ""
+
+
+def _check_owner(project_id: str) -> None:
+    if _AUTH_MODE == "accounts":
+        directory = _CONFIG.paths.project_dir(project_id)
+        if (directory.is_symlink() or directory.resolve().parent != _CONFIG.paths.projects.resolve()
+                or not _CONFIG.paths.project_db(project_id).resolve().is_relative_to(directory.resolve())
+                or not _ACCOUNT_STORE.owns(project_id, _active_user())):
+            raise HTTPException(404, "项目不存在")
 _PROJECTS: dict[str, ProjectState] = {}
 _BRIDGE = HumanCallbackBridge()
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()  # Move confirmation and project archive share this short guard.
 
 
 def _recover_project_topic(pid: str) -> str:
@@ -276,7 +339,11 @@ def _recover_project_topic(pid: str) -> str:
     3. 兜底空字符串（前端提示重新确认主题）
     """
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(pid))
+        store = KnowledgeStore(_CONFIG.paths.project_db(pid),read_only=True)
+        saved = store.get_kv("pipeline.context.v1", {}) or {}
+        selected = (saved.get("data", {}) or {}).get("topic_discovery.selected_topic")
+        if selected:
+            return str(selected)
         topic = store.get_kv("research.topic", "")
         if topic:
             return str(topic)
@@ -299,7 +366,7 @@ def _scan_existing_projects() -> None:
 
     项目数据（knowledge.db / snapshots）持久化在 projects/ 目录，
     但 ProjectState 是进程内存单例，服务重启即丢失。此函数让重启后
-    旧项目仍可通过 Web 访问（论文/材料/证据等数据按 project_id 读取）。
+    旧项目仍可通过 Web 访问（论文/知识三元组/证据等数据按 project_id 读取）。
     topic 不持久化（ProjectSession 快照不含），恢复项目显示 topic 为空，
     重新运行前需在 UI 确认主题。
     """
@@ -307,42 +374,82 @@ def _scan_existing_projects() -> None:
     if not projects_dir.exists():
         return
     for pdir in sorted(projects_dir.iterdir()):
-        if not pdir.is_dir() or pdir.name in _PROJECTS:
+        if not pdir.is_dir() or pdir.is_symlink() or pdir.name in _PROJECTS:
             continue
         if not (pdir / "knowledge.db").exists():
             continue
         pid = pdir.name
-        # created_at 从目录名解析：proj_YYYYMMDD_HHMMSS_xxxx
-        created_at = datetime.utcnow().isoformat()
-        try:
-            _, ts = pid.split("_", 1)
-            created_at = datetime.strptime(ts[:13], "%Y%m%d_%H%M%S").isoformat()
-        except Exception:
-            pass
+        # Read persisted times, never make a historical project "new" on scan.
+        catalog_entry = project_metadata(pdir / "knowledge.db", pid)
+        created_at = catalog_entry["created_at"] or ""
+        if catalog_entry["data_status"] != "available":
+            _PROJECTS[pid] = ProjectState(project_id=pid, topic="", created_at=created_at,
+                status="unavailable", summary="项目数据库不可读取，原目录保留；未自动修复或建立替代库。")
+            continue
         # 从 session 快照推断运行状态
         status, summary = "created", ""
         try:
-            session = ProjectSession.load(pid, _CONFIG.paths)
-            cur = session.current_stage().value
+            boundary=inspect_boundary(_CONFIG.paths,pid)
+            cur = historical_stage(boundary)
             done = [s for s in LifecycleStage.ordered()
-                    if session.status_of(s).value in ("completed", "blocked", "failed")]
-            if done or cur != LifecycleStage.RESEARCH.value:
+                    if boundary["stage_statuses"].get(s.value) in ("done","blocked")]
+            if all(boundary["stage_statuses"].get(s.value) == "done" for s in LifecycleStage.ordered()):
                 status = "completed"
-                summary = f"服务重启后自动恢复（最近阶段: {cur}）"
+                summary = "服务重启后恢复：全流程已完成"
+            elif done or cur != LifecycleStage.RESEARCH.value:
+                status = "stopped"
+                summary = f"服务曾重启，运行已中断；数据已保留（最近阶段: {cur}），可继续运行"
             else:
                 summary = "服务重启后自动恢复（数据可查看，重新运行需确认主题）"
         except Exception:
             status, summary = "created", "服务重启后自动恢复"
+        try:
+            store = KnowledgeStore(_CONFIG.paths.project_db(pid),read_only=True)
+            saved_run = store.get_kv("pipeline.context.v1", {}) or {}
+            domain = store.get_kv("project.domain", "") or ""
+        except Exception:
+            logger.warning("项目 %s 的知识库无法读取，跳过恢复", pid)
+            continue
+        if not isinstance(saved_run, dict):
+            saved_run = {}
+        saved_history = saved_run.get("history", []) or []
+        if saved_history and status == "created":
+            status = "stopped"
+            summary = "已有执行材料和节点历史已恢复，可从上次位置继续"
+        if saved_history and saved_history[-1].get("status") == "failed" and status != "completed":
+            status = "failed"
+            summary = saved_history[-1].get("summary", "上次节点执行失败，可从失败处恢复")
+        if status != "completed" and (saved_run.get("data", {}).get("experiment.outcome") or {}).get("recommendation") == "wait_for_user_results":
+            status = "experiment_pending"
+            summary = "历史实验任务与方法已恢复，仅供查看与导出；当前产品不继续实验或写作。"
+        try:
+            persisted_discovery = KnowledgeStore(_CONFIG.paths.project_db(pid),read_only=True).get_kv(
+                "web.topic_discovery", {}
+            ) or {}
+        except Exception:
+            persisted_discovery = {}
+        if persisted_discovery and status == "created":
+            status = "stopped"
+            summary = "服务曾重启，方向推荐已保留；可查看推荐并继续项目"
         _PROJECTS[pid] = ProjectState(
             project_id=pid,
-            topic=_recover_project_topic(pid),
+            topic=persisted_discovery.get("selected_topic") or _recover_project_topic(pid),
             created_at=created_at,
             status=status,
             summary=summary,
+            topic_discovery=persisted_discovery,
+            domain=domain,
+            display_name=store.get_kv("project.display_name", "") or "",
+            node_history=saved_history,
+            run_mode="pipeline" if (saved_run.get("data", {}) or {}).get("topic_discovery.selected_topic") else (
+                "topic_discovery" if saved_run.get("current_stage") == "topic_discovery"
+                else store.get_kv("web.run_mode", "pipeline")),
+            search_prefs=store.get_kv("web.search_prefs") or None,
         )
 
 
-_scan_existing_projects()
+if os.environ.get("SRA_WEB_SKIP_PROJECT_SCAN") != "1":
+    _scan_existing_projects()
 
 
 # ===== Pipeline 工作线程 =====
@@ -352,6 +459,10 @@ def _set_state_status(state: ProjectState, status: str) -> None:
     """线程安全更新项目状态。"""
     with _LOCK:
         state.status = status
+        if status == "pending_human":
+            state.summary = "等待你的审核与确认，已有产出已保留"
+        elif status == "running":
+            state.summary = "后台任务运行中，浏览其他页面不会取消任务"
 
 
 def _make_progress_callback(
@@ -394,21 +505,22 @@ def _run_pipeline_thread(project_id: str, topic: str, resume: bool, force_writin
     state = _PROJECTS.get(project_id)
     if state is None:
         return
+    boundary = inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+    if boundary["restricted"] or boundary["reason"] == "design_generated":
+        return  # Never repair or restart an out-of-scope historical checkpoint.
     try:
         _set_state_status(state, "running")
         pipeline = Pipeline(config=_CONFIG)
         # dry_run 模式下也使用桥接回调，让用户能介入；非 dry_run 同样使用桥接
         # 人工等待期间将 status 置为 pending_human，前端可明确感知
+        _progress_cbs = _make_progress_callback(state)
+        state.run_mode = "pipeline"
+        KnowledgeStore(_CONFIG.paths.project_db(project_id)).save_kv("web.run_mode", "pipeline")
         human_cb = _BRIDGE.make_callback(
             project_id,
             on_pending=lambda: _set_state_status(state, "pending_human"),
             on_resume=lambda: _set_state_status(state, "running"),
         )
-        _progress_cbs = _make_progress_callback(state)
-        state.status = "running"
-        pipeline = Pipeline(config=_CONFIG)
-        # dry_run 模式下也使用桥接回调，让用户能介入；非 dry_run 同样使用桥接
-        human_cb = _BRIDGE.make_callback(project_id)
         result: PipelineResult = pipeline.run_pipeline(
             project_id=project_id,
             topic=topic,
@@ -418,6 +530,7 @@ def _run_pipeline_thread(project_id: str, topic: str, resume: bool, force_writin
             on_node_started=_progress_cbs[1],
             force_writing=force_writing,
             initial_ctx={RESEARCH_SEARCH_PREFS: state.search_prefs} if state.search_prefs else None,
+            domain=state.domain,
         )
         state.last_result = result
         state.status = result.status
@@ -434,121 +547,19 @@ def _run_pipeline_thread(project_id: str, topic: str, resume: bool, force_writin
         state.summary = f"Pipeline 执行异常: {e}"
 
 
-def _run_discovery_thread(project_id: str, topic: str, resume: bool) -> None:
-    """工作线程函数：执行构效关系发现（路线 A）并更新项目状态。"""
-    state = _PROJECTS.get(project_id)
-    if state is None:
-        return
-    try:
-        _set_state_status(state, "running")
-        state.run_mode = "discovery"
-        pipeline = Pipeline(config=_CONFIG)
-        human_cb = _BRIDGE.make_callback(
-            project_id,
-            on_pending=lambda: _set_state_status(state, "pending_human"),
-            on_resume=lambda: _set_state_status(state, "running"),
-        )
-        _progress_cbs = _make_progress_callback(state)
-        state.status = "running"
-        state.run_mode = "discovery"
-        pipeline = Pipeline(config=_CONFIG)
-        human_cb = _BRIDGE.make_callback(project_id)
-        result: PipelineResult = pipeline.run_discovery(
-            project_id=project_id,
-            topic=topic,
-            human_callback=human_cb,
-            resume=resume,
-            on_progress=_progress_cbs[0],
-            on_node_started=_progress_cbs[1],
-        )
-        state.last_result = result
-        state.status = result.status
-        state.summary = result.summary
-        state.recommendation = result.recommendation
-        # 方法改进建议：从实验成败评估 outcome.advice 透传给前端展示
-        state.advice = (result.experiment_outcome or {}).get("advice", []) or []
-        state.node_history = result.node_history or []
-        state.current_node = None
-        state.next_nodes = []
-        # 从 node_history 提取 discovery 产出摘要
-        state.discovery = _extract_discovery_summary(
-            result.node_history, result.extra.get("hypotheses") or []
-        )
-        # 从 node_history 提取 discovery 产出摘要
-        state.discovery = _extract_discovery_summary(result.node_history)
-    except Exception as e:  # noqa: BLE001
-        state.status = "failed"
-        state.error = f"{type(e).__name__}: {e}"
-        state.summary = f"Discovery 执行异常: {e}"
-
-
-def _extract_discovery_summary(node_history: list[dict], hypotheses: list[dict] | None = None) -> dict:
-    """从节点历史提取 discovery 产出摘要。"""
-    summary = {
-        "hypotheses": 0, "candidates": 0, "relationships": 0, "novel": 0,
-        "nodes": [], "hypothesis_list": [],
-    }
-def _extract_discovery_summary(node_history: list[dict]) -> dict:
-    """从节点历史提取 discovery 产出摘要。"""
-    summary = {"hypotheses": 0, "candidates": 0, "relationships": 0, "novel": 0, "nodes": []}
-    for h in node_history or []:
-        node_id = h.get("node_id", "")
-        if node_id in ("hypothesis_seed", "search_space", "llm_guided_search",
-                        "discovery_validate", "discovery_report"):
-            summary["nodes"].append({
-                "node_id": node_id,
-                "status": h.get("status"),
-                "summary": h.get("summary", ""),
-            })
-            if node_id == "hypothesis_seed" and "个候选构效关系假设" in h.get("summary", ""):
-                try:
-                    summary["hypotheses"] = int(h["summary"].split("生成")[1].split("个")[0])
-                except (IndexError, ValueError):
-                    pass
-            if node_id == "discovery_validate" and "条验证发现" in h.get("summary", ""):
-                try:
-                    summary["relationships"] = int(
-                        h["summary"].split("验证")[1].split("条")[0])
-                    if "条 novel" in h["summary"]:
-                        summary["novel"] = int(
-                            h["summary"].split("其中 ")[1].split(" 条")[0])
-                except (IndexError, ValueError):
-                    pass
-    # 假设列表（含三维可验证性评分），按综合分降序，供 Web 排序展示
-    h_list: list[dict] = []
-    for hyp in hypotheses or []:
-        if not isinstance(hyp, dict) or not hyp.get("hypothesis"):
-            continue
-        def _f(key: str) -> float:
-            try:
-                return float(hyp.get(key, 0.0))
-            except (TypeError, ValueError):
-                return 0.0
-        n_, f_, g_ = _f("novelty_score"), _f("feasibility_score"), _f("gap_relevance_score")
-        h_list.append({
-            "hypothesis": hyp.get("hypothesis", ""),
-            "variables": hyp.get("variables", []) or [],
-            "target_property": hyp.get("target_property", ""),
-            "rationale": hyp.get("rationale", ""),
-            "gap_ref": hyp.get("gap_ref", ""),
-            "novelty_score": round(n_, 2),
-            "feasibility_score": round(f_, 2),
-            "gap_relevance_score": round(g_, 2),
-            "overall_score": round(0.4 * n_ + 0.3 * f_ + 0.3 * g_, 2),
-        })
-    h_list.sort(key=lambda x: x["overall_score"], reverse=True)
-    summary["hypothesis_list"] = h_list
-    return summary
-
 
 def _run_topic_discovery_thread(project_id: str, interest: str, resume: bool) -> None:
     """工作线程函数：执行方向推荐并更新项目状态。"""
     state = _PROJECTS.get(project_id)
     if state is None:
         return
+    boundary = inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+    if boundary["restricted"] or boundary["reason"] == "design_generated":
+        return
     try:
         _set_state_status(state, "running")
         state.run_mode = "topic_discovery"
+        KnowledgeStore(_CONFIG.paths.project_db(project_id)).save_kv("web.run_mode", "topic_discovery")
         pipeline = Pipeline(config=_CONFIG)
         human_cb = _BRIDGE.make_callback(
             project_id,
@@ -563,6 +574,9 @@ def _run_topic_discovery_thread(project_id: str, interest: str, resume: bool) ->
                     "recommendations": recs,
                     "interest": interest,
                 }
+            KnowledgeStore(_CONFIG.paths.project_db(project_id)).save_kv(
+                "web.topic_discovery", state.topic_discovery
+            )
 
         _progress_cbs = _make_progress_callback(state)
         result: PipelineResult = pipeline.run_topic_discovery(
@@ -574,6 +588,7 @@ def _run_topic_discovery_thread(project_id: str, interest: str, resume: bool) ->
             on_recommendations=_publish_recommendations,
             on_progress=_progress_cbs[0],
             on_node_started=_progress_cbs[1],
+            domain=state.domain,
         )
         state.last_result = result
         state.status = result.status
@@ -583,10 +598,19 @@ def _run_topic_discovery_thread(project_id: str, interest: str, resume: bool) ->
         state.current_node = None
         state.next_nodes = []
         # 存储方向推荐完整数据（推荐列表 + 选择结果）
-        state.topic_discovery = result.extra or {}
+        # 失败/中止结果通常没有 extra；不可擦掉已发布的真实推荐。
+        if result.extra:
+            state.topic_discovery = {**state.topic_discovery, **result.extra}
+        if state.topic_discovery:
+            KnowledgeStore(_CONFIG.paths.project_db(project_id)).save_kv(
+                "web.topic_discovery", state.topic_discovery
+            )
         # 若用户已选定主题，自动把所选主题写入 state.topic，并启动 research pipeline
         selected = (result.extra or {}).get("selected_topic", "") or ""
         if result.status == "completed" and selected.strip():
+            boundary = inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+            if boundary["restricted"] or boundary["reason"] == "design_generated":
+                return
             with _LOCK:
                 state.topic = selected.strip()
                 state.run_mode = "pipeline"
@@ -597,7 +621,14 @@ def _run_topic_discovery_thread(project_id: str, interest: str, resume: bool) ->
                 args=(project_id, selected.strip(), resume2, False),
                 daemon=True,
             )
-            pipeline_thread.start()
+            with _LOCK:
+                # Track the new worker, not the topic-discovery worker that is
+                # about to exit; otherwise resume may mistake a live wait for
+                # an orphan and clear its human confirmation bridge.
+                state.thread = pipeline_thread
+                state.status = "running"
+                pipeline_thread.start()
+            pipeline_thread.join()
     except Exception as e:  # noqa: BLE001
         state.status = "failed"
         state.error = f"{type(e).__name__}: {e}"
@@ -654,12 +685,45 @@ def _extract_topic_discovery_summary(node_history: list[dict]) -> dict:
 # ===== FastAPI 应用 =====
 
 
-app = FastAPI(title="科研 Agent 系统", version="0.1.0")
+from contextlib import asynccontextmanager
+from core.instance_state import running_instance
+
+
+@asynccontextmanager
+async def _instance_lifespan(application):
+    def settled():
+        counts = RESOURCES.snapshot()
+        return not counts["heavy"] and not counts["receive"] and not any(
+            p.thread is not None and p.thread.is_alive() for p in _PROJECTS.values()
+        )
+    with running_instance(_CONFIG.paths.root, _CONFIG.paths.projects,
+                          _ACCOUNT_STORE.path if _AUTH_MODE == "accounts" else None,
+                          _AUTH_MODE, clean_shutdown=settled):
+        from core.workspace.conversation_moves import recover_journals
+        if recover_journals(_CONFIG.paths):_scan_existing_projects()
+        yield
+
+
+app = FastAPI(title="科研 Agent 系统", version="0.1.0", lifespan=_instance_lifespan)
+
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
+
+
+@app.exception_handler(RequestValidationError)
+async def private_login_validation(request, exc):
+    if request.url.path in {"/api/auth/login", "/api/auth/register"}:
+        # FastAPI's default validation includes the rejected input. Never echo
+        # a password in a validation response or an attached error report.
+        registering = request.url.path == "/api/auth/register"
+        return JSONResponse({"detail":"请填写有效邮箱，并设置 8–256 位且确认一致的密码" if registering else "邮箱或密码错误，或尝试过于频繁，请稍后重试"}, status_code=422 if registering else 401,
+                            headers={"Cache-Control":"private, no-store"})
+    return await request_validation_exception_handler(request, exc)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -671,60 +735,214 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # ===== 接口实现 =====
 
 
+def _public_domain(domain: str) -> str:
+    try:
+        return normalize_public_domain(domain)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _writing_artifact_count(store) -> int:
+    from core.knowledge.schema import ArtifactType
+    latest = {}
+    for artifact in store.list_artifacts():
+        if artifact.artifact_type in (ArtifactType.PAPER_DRAFT, ArtifactType.REVIEW_NOTE):
+            old = latest.get(artifact.artifact_group)
+            if old is None or artifact.version > old.version:
+                latest[artifact.artifact_group] = artifact
+    return sum(bool(a.content or a.content_path) for a in latest.values())
+
+
+def _engine_continuation(state: ProjectState, store=None, stage_statuses=None) -> dict:
+    """只描述当前可执行动作；浏览状态不自动启动任务或确认科研结论。"""
+    boundary=inspect_boundary(_CONFIG.paths,state.project_id,pending=_BRIDGE.get_pending(state.project_id),observed_status=state.status,observed_history=state.node_history)
+    if boundary["restricted"]:
+        return {"action":"view_only","label":"查看与导出历史材料","page":"dashboard","hint":boundary["message"],
+                "stage":boundary.get("execution_stage",""),"run_mode":state.run_mode or "pipeline","product_boundary":public_boundary(boundary)}
+    store = store or KnowledgeStore(_CONFIG.paths.project_db(state.project_id),read_only=True)
+    saved = store.get_kv("pipeline.context.v1", {}) or {}
+    data = saved.get("data", {}) or {}
+    history = saved.get("history", []) or state.node_history or []
+    last = history[-1] if history else {}
+    td = {**(store.get_kv("web.topic_discovery", {}) or {}), **state.topic_discovery}
+    selected = data.get("topic_discovery.selected_topic") or td.get("selected_topic")
+    mode = "pipeline" if selected else (
+        "topic_discovery" if saved.get("current_stage") == "topic_discovery"
+        else state.run_mode or store.get_kv("web.run_mode", "pipeline"))
+    stage = saved.get("current_stage") or ("topic_discovery" if mode == "topic_discovery" else "research")
+    info = {"action": "resume", "label": "继续当前任务", "page": "progress", "run_mode": mode,
+            "stage": stage, "node_id": saved.get("current_node_id") or last.get("node_id"),
+            "hint": "从已保存的阶段继续；已完成的材料保留，未完成或失败的请求可能需要重试。"}
+    if not is_public_domain(state.domain):
+        return {**info, "action": "view_only", "label": "查看历史材料", "page": "dashboard", "hint": "该历史领域暂不开放新运行，已有材料与记录保留。"}
+    live = state.thread is not None and state.thread.is_alive()
+    if live:
+        pending = _BRIDGE.get_pending(state.project_id)
+        return {**info, "action": "confirm" if pending else "running", "label": "前往确认" if pending else "查看运行进度",
+                "page": "human" if pending else "progress", "hint": "等待你审核，浏览器可以关闭。" if pending else "任务正在运行，不会重复启动。"}
+    done = stage_statuses and all(stage_statuses.get(s.value) == "done" for s in LifecycleStage.ordered())
+    if boundary["reason"]=="design_generated":
+        return {**info,"action":"materials","page":"experiments","label":"确认并审阅已有方案","hint":"方法文档已保留；请确认研究问题及关联方案后审阅或导出，不启动后续阶段。"}
+    if done or (state.status == "completed" and mode != "topic_discovery"):
+        hint = "后台流程已结束，可核对与导出已有材料；不代表创新已经成立。"
+        if store.get_kv("writing.results_need_review"):
+            hint = "终稿保存后结果有更新，已有稿件未自动改写。请核对新结果与稿件差异后人工修订，不能将旧稿视为最新结论。"
+        return {**info, "action": "materials", "label": "核对已有问题与方案", "page": "experiments", "hint": "后台材料任务已结束，请核对已有研究问题与方案；本轮止于方案，不继续写作。"}
+    outcome = data.get("experiment.outcome", {}) or {}
+    if state.status == "experiment_pending" or outcome.get("recommendation") == "wait_for_user_results":
+        return {**info, "action": "view_only", "label": "查看历史实验材料", "page": "experiments", "hint": NOTICE,
+                "product_boundary": {**public_boundary(boundary), "restricted": True, "reason": "legacy_stage_restricted", "execution_stage": "experiment"}}
+    if mode == "topic_discovery":
+        info.update(label="继续选题探索", hint="恢复选题探索及主题确认，不跳过选题直接启动主科研流程。")
+    if last.get("status") == "pending_human":
+        info.update(label="恢复待确认事项", hint="重新打开上次的确认节点，保留已有材料，不会自动替你确认。",restore_gate=True)
+    return info
+
+
+def _workspace_workflow(state: ProjectState, store=None, stage_statuses=None, *, include_materials=False) -> dict:
+    from core.workspace.service import WorkspaceService
+    execution = _engine_continuation(state,store,stage_statuses)
+    service = WorkspaceService(state.project_id,_CONFIG.paths.project_db(state.project_id),initialize_store=False)
+    workflow = service.workflow(execution=execution)
+    if not include_materials:
+        workflow["materials"] = [{key:value for key,value in source.items() if key!="content"} for source in workflow["materials"]]
+    return workflow
+
+
+def _continuation(state: ProjectState, store=None, stage_statuses=None) -> dict:
+    return _workspace_workflow(state,store,stage_statuses)["continuation"]
+
+
 @app.post("/api/projects")
 def create_project(req: CreateProjectRequest) -> dict:
     """创建新项目，返回 project_id。"""
     topic = (req.topic or "").strip()
     if not topic:
         raise HTTPException(status_code=400, detail="topic 不能为空")
+    domain = _public_domain(req.domain)
     project_id = f"proj_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     state = ProjectState(
         project_id=project_id,
         topic=topic,
         created_at=datetime.utcnow().isoformat(),
+        domain=domain,
     )
     with _LOCK:
         _PROJECTS[project_id] = state
-    return {"project_id": project_id, "topic": topic, "created_at": state.created_at}
+    if _AUTH_MODE == "accounts":
+        _ACCOUNT_STORE.claim_new(project_id, _active_user())
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    store.save_kv("research.topic", topic)
+    store.save_kv("project.domain", state.domain)
+    store.save_kv("project.created_at", state.created_at)
+    return {
+        "project_id": project_id,
+        "topic": topic,
+        "created_at": state.created_at,
+        "domain": state.domain,
+    }
 
 
 @app.get("/api/projects")
-def list_projects() -> dict:
-    """列出所有项目（供前端刷新后恢复）。"""
+def list_projects(
+    limit: Annotated[int | None, Query(ge=1, le=100)] = None,
+    offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    q: Annotated[str, Query(max_length=200)] = "",
+    include_project_id: str | None = None,
+) -> dict:
+    """Bounded catalog for new clients; no-query legacy response is preserved."""
     with _LOCK:
-        items = [
-            {
-                "project_id": s.project_id,
-                "topic": s.topic,
-                "created_at": s.created_at,
-                "status": s.status,
-                "summary": s.summary,
-            }
-            for s in _PROJECTS.values()
-        ]
-    # 按创建时间降序
-    items.sort(key=lambda x: x["created_at"], reverse=True)
-    return {"projects": items}
+        _scan_existing_projects()
+        states = list(_PROJECTS.values())
+        if _AUTH_MODE == "accounts":
+            allowed = _ACCOUNT_STORE.project_ids(_active_user())
+            states = [state for state in states if state.project_id in allowed]
+    page = project_page(project_rows(_CONFIG.paths, states), limit=limit, offset=offset,
+                        q=q, include_project_id=include_project_id)
+    # New paged clients only: derive shared progress for the visible project
+    # page, not every project's conversations or full history on each sidebar read.
+    if limit is not None:
+        from core.workspace.read_model import progress
+        from core.workspace.service import WorkspaceService
+        for row in [*page["projects"], *([page["current_project"]] if page["current_project"] else [])]:
+            if row.get("data_status") != "available":
+                continue
+            try:
+                row["research_progress"] = progress(WorkspaceService(row["project_id"], _CONFIG.paths.project_db(row["project_id"]), initialize_store=False).workflow())
+            except Exception:  # Read failure is not permission to initialize/repair a historical DB.
+                row["research_progress"] = {"label": "研究材料暂不可读取，请核对", "planReady": False}
+    return page
+
+
+@app.get("/api/conversations/recent")
+def list_recent_conversations(
+    limit: Annotated[int, Query(ge=1, le=50)] = 8,
+    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    include_project_id: str | None = None,
+    include_conversation_id: str | None = None,
+    q: Annotated[str, Query(max_length=200)] = "",
+) -> dict:
+    with _LOCK:
+        _scan_existing_projects()
+        states = list(_PROJECTS.values())
+        if _AUTH_MODE == "accounts":
+            allowed = _ACCOUNT_STORE.project_ids(_active_user())
+            states = [state for state in states if state.project_id in allowed]
+    projects = project_rows(_CONFIG.paths, states)
+    result = recent_conversations(_CONFIG.paths, projects, limit=limit, offset=offset,q=q)
+    result["current_conversation"] = None
+    selected = next((p for p in projects if p["project_id"] == include_project_id and p["data_status"] == "available"), None)
+    if selected and include_conversation_id:
+        from core.workspace.conversations import ConversationService
+        try:
+            c = ConversationService(include_project_id, _CONFIG.paths.project_db(include_project_id)).get(include_conversation_id)
+            result["current_conversation"] = {**c, "project_name": selected["display_name"], "project_topic": selected["topic"]}
+        except ValueError:
+            pass  # Bad/deleted selection never invents a replacement conversation.
+    return result
 
 
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: str) -> dict:
-    """删除项目：清理内存中的 ProjectState，并删除磁盘上的项目目录（含 knowledge.db）。"""
-    # 内存清理
+    result = delete_projects_batch(BatchDeleteProjectsRequest(project_ids=[project_id]))
+    return {"project_id": project_id, "deleted": True, "recoverable": True, "archive_id": result["archive_id"]}
+
+
+@app.post("/api/projects/batch-delete")
+def delete_projects_batch(req: BatchDeleteProjectsRequest) -> dict:
+    """Preflight the whole selection, archive files, then remove active entries."""
+    ids = req.project_ids
+    for pid in ids:
+        _check_owner(pid)
+    if len(ids) != len(set(ids)):
+        raise HTTPException(status_code=422, detail="项目编号重复，本批未删除")
+    if any(not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", pid) for pid in ids):
+        raise HTTPException(status_code=422, detail="项目编号不合法，本批未删除")
     with _LOCK:
-        state = _PROJECTS.pop(project_id, None)
-        if state is not None and state.thread and state.thread.is_alive():
-            # 线程仍在运行：不允许删除，避免留下孤立线程
-            _PROJECTS[project_id] = state
-            raise HTTPException(
-                status_code=409,
-                detail="项目正在运行中，请先中止 Pipeline 再删除",
-            )
-    # 磁盘清理：项目目录（knowledge.db / vectors / snapshots / artifacts / uploads / experiments）
-    project_dir = _CONFIG.paths.project_dir(project_id)
-    if project_dir.exists() and project_dir.resolve().is_relative_to(_CONFIG.paths.projects.resolve()):
-        shutil.rmtree(project_dir, ignore_errors=True)
-    return {"project_id": project_id, "deleted": True}
+        for pid in ids:
+            state = _PROJECTS.get(pid)
+            if state is None:
+                raise HTTPException(status_code=404, detail=f"项目不存在：{pid}；本批未删除，请刷新列表")
+            if (state.status in ("running", "pending_human") or state.thread and state.thread.is_alive()
+                    or _METHOD_REGEN_JOBS.get(pid, {}).get("status") == "running"):
+                raise HTTPException(status_code=409, detail=f"项目 {pid} 正在运行或等待确认；本批未删除")
+            try:
+                if has_active_chat(_CONFIG.paths.project_db(pid), pid):
+                    raise HTTPException(409, f"项目 {pid} 对话仍在生成；本批未归档，请完成后再试")
+            except ValueError as exc:
+                raise HTTPException(409, f"项目 {pid} 的对话运行状态暂不可核对；本批未归档") from exc
+        try:
+            archive_id = archive_project_directories(_CONFIG.paths, ids)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except (RuntimeError, OSError) as error:
+            raise HTTPException(status_code=500, detail=str(error)) from error
+        for pid in ids:
+            _PROJECTS.pop(pid, None)
+            _METHOD_REGEN_JOBS.pop(pid, None)
+            _BRIDGE.clear(pid)
+    return {"deleted": ids, "recoverable": True, "archive_id": archive_id,
+            "message": f"已将 {len(ids)} 个项目移入本机可恢复归档，不会直接抹除研究文件。"}
 
 
 @app.get("/api/projects/{project_id}/status")
@@ -733,39 +951,63 @@ def get_status(project_id: str) -> dict:
     # 当前阶段：从 session 读取（若已启动）
     current_stage = ""
     stage_statuses: dict[str, str] = {}
-    try:
-        session = ProjectSession.load(project_id, _CONFIG.paths)
-        current_stage = session.current_stage().value
-        for stage in LifecycleStage.ordered():
-            stage_statuses[stage.value] = session.status_of(stage).value
-    except Exception:  # noqa: BLE001
-        pass
+    boundary = inspect_boundary(_CONFIG.paths,project_id)
+    current_stage = historical_stage(boundary)
+    stage_statuses = {s.value:boundary["stage_statuses"].get(s.value,"not_started") for s in LifecycleStage.ordered()}
 
     # 产出物计数
     counts = {"papers": 0, "ideas": 0, "claims": 0, "experiments": 0, "evidence": 0,
-              "materials": 0, "properties": 0, "synthesis": 0, "gaps": 0}
+              "entities": 0, "properties": 0, "methods": 0, "gaps": 0, "report_gaps": 0, "writing_artifacts": 0}
+    notes_count = None
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         counts["papers"] = len(store.list_papers())
         counts["ideas"] = len(store.list_ideas())
         counts["claims"] = len(store.list_claims())
         counts["experiments"] = len(store.list_experiments())
         counts["evidence"] = store.evidence_stats()["total"]
         mstats = store.material_stats()
+        counts["entities"] = mstats["total_materials"]
+        # 兼容字段：前端/下载模板沿用 materials 键名，语义为「研究对象」
         counts["materials"] = mstats["total_materials"]
         counts["properties"] = mstats["total_properties"]
         counts["synthesis"] = mstats["total_synthesis"]
         counts["gaps"] = store.gap_stats()["total"]
+        # 导航「研究现状」统计报告内的问题，而非全部结构化研究缺口。
+        report = store.get_kv("cross_validation_report") or {}
+        counts["report_gaps"] = len(report.get("gaps") or [])
+        counts["writing_artifacts"] = _writing_artifact_count(store)
+        notes_count = len(_merged_project_notes(store, state))
     except Exception:  # noqa: BLE001
         pass
 
     pending = _BRIDGE.get_pending(project_id)
 
+    # 节点级进度（如 paper_fetch 的检索进度条），读不到则不返回该字段
+    node_progress = None
+    try:
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
+        node_progress = store.get_kv("web.paper_fetch_progress")
+    except Exception:  # noqa: BLE001
+        node_progress = None
+
+    with _LOCK:
+        status_value = state.status
+        pending = _BRIDGE.get_pending(project_id)
+    workflow = _workspace_workflow(state,stage_statuses=stage_statuses)
+    from core.workspace.read_model import material_counts
+    from core.workspace.conversations import ConversationService
+    try:
+        saved_material_counts = material_counts(ConversationService(project_id, _CONFIG.paths.project_db(project_id)))
+    except Exception:
+        saved_material_counts = {}
     return {
         "project_id": project_id,
         "topic": state.topic,
+        "domain": state.domain,
         "created_at": state.created_at,
-        "status": state.status,
+        "status": status_value,
+        "run_mode": state.run_mode,
         "summary": state.summary,
         "recommendation": state.recommendation,
         "advice": state.advice,
@@ -776,21 +1018,64 @@ def get_status(project_id: str) -> dict:
         "current_node": state.current_node,
         "next_nodes": state.next_nodes,
         "counts": counts,
+        "notes_count": notes_count,
         "pending_human": pending,
         "search_prefs": state.search_prefs,
         "topic_discovery": state.topic_discovery,
-        "counts": counts,
-        "pending_human": pending,
+        "node_progress": node_progress,
+        "product_stage":workflow["product_stage"],
+        "product_boundary":workflow["product_boundary"],
+        "continuation": workflow["continuation"],
+        "workflow": workflow,
+        "material_counts": saved_material_counts,
     }
+
+
+@app.post("/api/projects/{project_id}/resume")
+def resume_project_task(project_id: str) -> dict:
+    """统一继续入口：选题/主流程自动分流，运行中与等待结果时不重复启动。"""
+    state = _require_project(project_id)
+    status_view = get_status(project_id)
+    info = {**status_view["continuation"],"product_stage":status_view["product_stage"],"product_boundary":status_view["product_boundary"]}
+    if info["action"] != "resume":
+        return {"project_id": project_id, **info, "message": info["hint"]}
+    with _LOCK:
+        if state.thread is not None and state.thread.is_alive():
+            return {"project_id": project_id, **info, "action": "running", "page": "progress", "message": "任务已在运行，不会重复启动。"}
+        if state.status in ("running", "pending_human"):
+            state.status = "stopped"
+            _BRIDGE.clear(project_id)
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    saved = store.get_kv("pipeline.context.v1", {}) or {}
+    selected = (saved.get("data", {}) or {}).get("topic_discovery.selected_topic")
+    if selected:
+        state.topic = selected
+    if info["run_mode"] == "topic_discovery":
+        td = store.get_kv("web.topic_discovery", {}) or state.topic_discovery
+        interest = td.get("interest") or (saved.get("data", {}) or {}).get("topic_discovery.interest") or state.topic
+        result = run_topic_discovery(project_id, TopicDiscoveryRequest(interest=interest, domain=state.domain))
+    else:
+        result = run_project(project_id)
+    if result.get("started") is False:
+        return result
+    return {**result, **info, "action": "started", "message": "已从保存的进度继续，最多推进到研究方案；需要确认时仍由你决定。"}
 
 
 @app.post("/api/projects/{project_id}/run")
 def run_project(project_id: str, req: Optional[RunProjectRequest] = None) -> dict:
     """启动/继续 pipeline（异步执行，立即返回）。
 
-    可选 body: {"force_writing": true} —— 实验失败后强制进入论文写作阶段。
+    网页不接受 force_writing；演示与真实模式均止于研究方案。
     """
     state = _require_project(project_id)
+    if req and req.force_writing:
+        raise HTTPException(status_code=422,detail=NOTICE)
+    boundary=inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+    workflow=_workspace_workflow(state)
+    info=workflow["continuation"]
+    if boundary["restricted"] or boundary["reason"]=="design_generated" or info["action"] in ("plan_ready","review_record"):
+        return {"project_id":project_id,**info,"message":info["hint"],"resumed":False,"force_writing":False,"started":False,"product_stage":workflow["product_stage"],"product_boundary":workflow["product_boundary"]}
+    _public_domain(state.domain)
     if state.status == "running":
         raise HTTPException(status_code=409, detail="pipeline 正在运行中")
     if state.status == "pending_human":
@@ -803,137 +1088,36 @@ def run_project(project_id: str, req: Optional[RunProjectRequest] = None) -> dic
             status_code=400,
             detail="项目主题为空（服务重启后恢复的项目不持久化 topic），请重新创建项目或补充主题",
         )
-    resume = state.status not in ("created",)
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    resume = state.status != "created" or bool(store.get_kv("pipeline.context.v1"))
     force_writing = (req.force_writing if req else False)
-    thread = threading.Thread(
-        target=_run_pipeline_thread,
-        args=(project_id, state.topic, resume, force_writing),
-        daemon=True,
-    )
-    state.thread = thread
-    state.error = None
-    thread.start()
+    with _LOCK:
+        if state.status in ("running", "pending_human") or (state.thread is not None and state.thread.is_alive()):
+            raise HTTPException(status_code=409, detail="已有任务正在运行或等待确认，不能重复启动")
+        lease = RESOURCES.acquire()
+        try:
+            thread = threading.Thread(target=lease.worker(lambda: _run_pipeline_thread(
+                project_id, state.topic, resume, force_writing)), daemon=True)
+        except Exception:
+            lease.close()
+            raise HTTPException(503, "后台任务未能启动，请保留原输入并手动重试") from None
+        state.thread = thread
+        state.error = None
+        state.status = "running"
+        state.run_mode = "pipeline"
+        try:
+            thread.start()
+        except Exception:
+            lease.close()
+            state.thread = None
+            state.status = "failed"
+            raise HTTPException(503, "后台任务未能启动，请保留原输入并手动重试") from None
     msg = "pipeline 已启动"
     if force_writing:
         msg = "pipeline 已启动（强制写作模式：绕过实验成败判断）"
-    return {"project_id": project_id, "message": msg, "resumed": resume, "force_writing": force_writing}
+    return {"project_id": project_id, "message": msg, "resumed": resume, "force_writing": force_writing,"product_stage":workflow["product_stage"],"product_boundary":workflow["product_boundary"]}
 
 
-@app.post("/api/projects/{project_id}/run-discovery")
-def run_discovery(project_id: str) -> dict:
-    """启动构效关系发现（路线 A）：research → discovery 子图。
-
-    异步执行，立即返回。结果通过 /status 与 /discoveries 接口查询。
-    """
-    state = _require_project(project_id)
-    if state.status == "running":
-        raise HTTPException(status_code=409, detail="任务正在运行中")
-    if state.status == "pending_human":
-        raise HTTPException(
-            status_code=409,
-            detail="当前等待人工响应，请先提交 human-response 或中止",
-        )
-    if not state.topic.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="项目主题为空（服务重启后恢复的项目不持久化 topic），请重新创建项目或补充主题",
-        )
-    resume = state.status not in ("created",)
-    thread = threading.Thread(
-        target=_run_discovery_thread,
-        args=(project_id, state.topic, resume),
-        daemon=True,
-    )
-    state.thread = thread
-    state.error = None
-    thread.start()
-    return {"project_id": project_id, "message": "discovery 已启动", "resumed": resume}
-
-
-@app.get("/api/projects/{project_id}/discoveries")
-def get_discoveries(project_id: str) -> dict:
-    """获取构效关系发现产出（路线 A）。
-
-    返回内容包括：
-    - relationships：构效关系 Claim 列表
-    - discovery_summary：发现汇总（含 novel 计数）
-    - reliability_scores：客观可信度评分（5 维度 + 风险标签）
-    - expert_assistance：专家辅助包（最近邻工艺 + 类似材料 + DFT + 实验 protocol）
-    - gap_scores：上游 Research Gap 质量评分（4 维度 + 综合分）
-    - run_mode：运行模式
-    """
-    state = _require_project(project_id)
-    # 从 KnowledgeStore 读取 discovery 阶段产出的 Claim（构效关系发现）
-    relationships: list[dict] = []
-    reliability_scores: list[dict] = []
-    expert_assistances: list[dict] = []
-    gap_scores: list[dict] = []
-    gap_summary: dict = {}
-    rel_summary: dict = {}
-    try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-        # Claim
-        for c in store.list_claims():
-            if c.source_stage == "discovery":
-                relationships.append({
-                    "claim_id": c.claim_id,
-                    "statement": c.statement,
-                    "status": c.status.value,
-                    "evidence_refs": c.evidence_refs,
-                    "created_at": c.created_at.isoformat() if c.created_at else None,
-                })
-        # 客观可信度评分（路线 A 客观指标：5 维度）
-        rel_kv = store.get_kv("discovery_reliability_scores") or {}
-        reliability_scores = rel_kv.get("scores", []) if isinstance(rel_kv, dict) else []
-        rel_summary = rel_kv.get("summary", {}) if isinstance(rel_kv, dict) else {}
-        # 专家辅助包（让材料专家感到"对我有用"）
-        expert_assistances = store.get_kv("discovery_expert_assistance") or []
-        # 上游 Gap 质量评分
-        gap_kv = store.get_kv("research_gap_scores") or {}
-        gap_scores = gap_kv.get("scores", []) if isinstance(gap_kv, dict) else []
-        gap_summary = gap_kv.get("summary", {}) if isinstance(gap_kv, dict) else {}
-        # 兼容旧数据：评分里没有 statement/paper_titles 时，用 research_gaps 表回填
-        # （gap_id → statement + evidence 论文标题），保证前端始终可读
-        if gap_scores:
-            try:
-                gaps_in_store = store.list_research_gaps()
-                gap_meta = {
-                    g.gap_id: g for g in gaps_in_store
-                }
-                enriched = []
-                for s in gap_scores:
-                    if s.get("statement") or s.get("paper_titles"):
-                        enriched.append(s)
-                        continue
-                    s2 = dict(s)
-                    g = gap_meta.get(s.get("gap_id", ""))
-                    if g:
-                        s2["statement"] = g.statement or ""
-                        evs = g.evidence or []
-                        s2["evidence"] = evs
-                        s2["paper_titles"] = [
-                            e.get("title", "") for e in evs if e.get("title")
-                        ][:5]
-                        s2["paper_ids"] = [
-                            e.get("paper_id", "") for e in evs if e.get("paper_id")
-                        ][:5]
-                    enriched.append(s2)
-                gap_scores = enriched
-            except Exception:  # noqa: BLE001
-                pass
-    except Exception as e:  # noqa: BLE001
-        pass
-    return {
-        "project_id": project_id,
-        "discovery_summary": state.discovery,
-        "relationships": relationships,
-        "reliability_scores": reliability_scores,
-        "reliability_summary": rel_summary,
-        "expert_assistances": expert_assistances,
-        "gap_scores": gap_scores,
-        "gap_summary": gap_summary,
-        "run_mode": state.run_mode,
-    }
 
 
 @app.post("/api/projects/{project_id}/run-topic-discovery")
@@ -945,6 +1129,10 @@ def run_topic_discovery(project_id: str, req: TopicDiscoveryRequest) -> dict:
     用户选择通过 /human-response 接口提交。
     """
     state = _require_project(project_id)
+    boundary=inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+    if boundary["restricted"] or boundary["reason"]=="design_generated":
+        info=_continuation(state)
+        return {"project_id":project_id,**info,"message":info["hint"],"started":False,"product_boundary":public_boundary(boundary)}
     interest = (req.interest or "").strip()
     if not interest:
         raise HTTPException(status_code=400, detail="interest 不能为空")
@@ -955,17 +1143,35 @@ def run_topic_discovery(project_id: str, req: TopicDiscoveryRequest) -> dict:
             status_code=409,
             detail="当前等待人工响应，请先提交 human-response 或中止",
         )
-    resume = state.status not in ("created",)
-    thread = threading.Thread(
-        target=_run_topic_discovery_thread,
-        args=(project_id, interest, resume),
-        daemon=True,
-    )
-    state.thread = thread
-    state.error = None
-    state.topic = interest  # 更新 topic 为用户输入的研究兴趣
-    thread.start()
-    return {"project_id": project_id, "message": "topic_discovery 已启动", "interest": interest}
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    resume = state.status != "created" or bool(store.get_kv("pipeline.context.v1"))
+    # 不允许通过该接口把历史非计算机项目静默改为另一领域。
+    _public_domain(state.domain)
+    domain = _public_domain((req.domain or "").strip() or state.domain)
+    with _LOCK:
+        if state.status in ("running", "pending_human") or (state.thread is not None and state.thread.is_alive()):
+            raise HTTPException(status_code=409, detail="已有任务正在运行或等待确认，不能重复启动")
+        lease = RESOURCES.acquire()
+        try:
+            thread = threading.Thread(target=lease.worker(lambda: _run_topic_discovery_thread(
+                project_id, interest, resume)), daemon=True)
+        except Exception:
+            lease.close()
+            raise HTTPException(503, "后台任务未能启动，请保留原输入并手动重试") from None
+        state.thread = thread
+        state.error = None
+        state.topic = interest
+        state.domain = domain
+        state.status = "running"
+        state.run_mode = "topic_discovery"
+        try:
+            thread.start()
+        except Exception:
+            lease.close()
+            state.thread = None
+            state.status = "failed"
+            raise HTTPException(503, "后台任务未能启动，请保留原输入并手动重试") from None
+    return {"project_id": project_id, "message": "topic_discovery 已启动", "interest": interest, "domain": domain}
 
 
 @app.get("/api/projects/{project_id}/recommendations")
@@ -983,7 +1189,7 @@ def get_recommendations(project_id: str) -> dict:
 def list_papers(project_id: str) -> dict:
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         papers = store.list_papers()
     except Exception as e:  # noqa: BLE001
         return {"papers": [], "error": f"读取失败: {e}"}
@@ -1037,6 +1243,8 @@ def list_papers(project_id: str) -> dict:
             "pdf_path": p.pdf_path,
             "created_at": p.created_at.isoformat() if p.created_at else None,
             "source_stage": p.source_stage,
+            "reading_scope": meta.get("reading_scope", ""),
+            "parse_error": meta.get("parse_error"),
             # 检索证据链字段（审计溯源：来源 / doc_id / 证据分 / 命中子问题）
             "source": meta.get("source", ""),
             "source_subquery": meta.get("source_subquery", ""),
@@ -1057,15 +1265,15 @@ def list_papers(project_id: str) -> dict:
 
 @app.get("/api/projects/{project_id}/materials")
 def list_materials(project_id: str) -> dict:
-    """获取材料知识库（Task 2：材料-性能-合成三元组）。
+    """获取领域知识库（Task 2：研究对象-评价指标-方法条件三元组）。
 
-    返回按材料聚合的知识：每种材料含其性能指标与合成方法，
-    均带来源论文与证据片段（可溯源）。满足赛题「知识抽取结构化」要求。
+    返回按研究对象聚合的知识：每个对象含其评价指标与方法条件，
+    均带来源论文与证据片段（可溯源）。满足「知识抽取结构化」要求。
 
     数据标准化（core/knowledge/normalize.py）：
     - 性能指标统一映射（ZT/zT/figure_of_merit → 热电优值，带标准符号/单位/类别）
     - 合成方法归类（固相法/熔融法/烧结法/计算模拟…）
-    - 材料体系分类（Bi₂Te₃ 基 / PbTe 基 / 钙钛矿 / 方钴矿…）
+    - 研究对象分类（按领域自动归类，如材料体系 / 细胞系 / 模型类别…）
     """
     from core.knowledge.normalize import (
         categorize_material,
@@ -1075,10 +1283,10 @@ def list_materials(project_id: str) -> dict:
 
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         materials = store.list_materials(limit=500)
         stats = store.material_stats()
-        # 聚合：材料 → 性能列表 + 合成列表
+        # 聚合：研究对象 → 评价指标列表 + 方法条件列表
         properties = store.list_material_properties()
         synthesis = store.list_material_synthesis()
         props_by_mat: dict[str, list[dict]] = {}
@@ -1179,14 +1387,14 @@ def list_materials(project_id: str) -> dict:
                 "properties": props,
                 "synthesis": syns,
             })
-        # ===== 材料间关联（会议纪要：给材料"牵线搭桥"）=====
+        # ===== 研究对象间关联（同体系 / 共指标 / 共方法 / 同论文）=====
         # 关联规则（任一命中即关联，附带关联类型与理由）：
-        #   1. same_system  ：材料类别相同（同体系，如同为铋碲系）
+        #   1. same_system  ：对象类别相同（同体系 / 同类别）
         #   2. same_property：报告了相同的归一化性能指标（如都测热电优值）
         #   3. same_method  ：合成方法类别相同（如都用固相法）
         #   4. same_paper   ：出自同一篇论文
         # 每条关联含 {material_id, name, formula, relation, reason}，
-        # 供前端材料卡片「关联材料」区块展示（点击跳转）。
+        # 供前端知识卡片「关联对象」区块展示（点击跳转）。
         mat_index: dict[str, dict] = {}
         for it in items:
             mat_index[it["material_id"]] = it
@@ -1239,70 +1447,6 @@ def list_materials(project_id: str) -> dict:
     }
 
 
-def _infer_target(props: list) -> str:
-    """从项目内性质数据推断研究目标性能（默认 ZT）。
-
-    统计 performance 维度性质（ZT/功率因子/转换效率）出现频率，取最高者；
-    无性能数据时默认 ZT（热电为项目主场景）。
-    """
-    from core.knowledge.normalize import normalize_property
-
-    counter: dict[str, int] = {}
-    for p in props:
-        norm = normalize_property(getattr(p, "property_name", ""), getattr(p, "property_name_cn", ""))
-        if norm.get("dimension") == "performance":
-            key = norm["key"]
-            counter[key] = counter.get(key, 0) + 1
-    if not counter:
-        return "ZT"
-    return max(counter, key=counter.get)
-
-
-@app.get("/api/projects/{project_id}/materials/{material_id}/profile")
-def get_material_profile(project_id: str, material_id: str) -> dict:
-    """获取材料深度分析画像（多维性质 → 机制 → 目标性能 → 对比 → 候选排序 → 合成路线）。
-
-    这是「材料选择 + 性质判断 + 合成方案设计 + 实验决策」的深度分析入口：
-    - 性质按六大维度分组（结构/电子/热/光/力/化学稳定性）
-    - 性质 → 机制 → 目标性能 关系解释（规则引擎 + LLM 增强）
-    - 目标性能因果拆解（如 ZT = S²σT/κ）
-    - 材料横向对比矩阵（单位统一 + 范围显示 + 证据等级）
-    - 材料候选排序（六维加权评分，可溯源）
-    - 合成路线对比 + 推荐 + 风险 + 可复现性评分
-
-    确定性规则引擎兜底，不编造数据；缺失值明确标记 missing。
-    """
-    from core.knowledge.material_analysis import build_profile
-    from core.knowledge.normalize import categorize_material
-
-    _require_project(project_id)
-    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-    mat = store.get_material(material_id)
-    if mat is None:
-        raise HTTPException(status_code=404, detail="材料不存在")
-
-    # 该材料的性质 + 合成
-    props = store.list_material_properties(material_id=material_id)
-    syns = store.list_material_synthesis(material_id=material_id)
-
-    # 全体材料（用于对比矩阵 + 候选排序）
-    all_materials = store.list_materials(limit=500)
-    all_props = store.list_material_properties()
-    all_syns = store.list_material_synthesis()
-    props_by_mat: dict[str, list] = {}
-    for p in all_props:
-        props_by_mat.setdefault(p.material_id, []).append(p)
-    syns_by_mat: dict[str, list] = {}
-    for s in all_syns:
-        syns_by_mat.setdefault(s.material_id, []).append(s)
-
-    target = _infer_target(all_props)
-    profile = build_profile(mat, props, syns, all_materials, props_by_mat, syns_by_mat, target)
-    profile["category"] = categorize_material(mat.name, mat.formula)
-    profile["target"] = target
-    return profile
-
-
 @app.get("/api/projects/{project_id}/gaps")
 def list_research_gaps(project_id: str) -> dict:
     """获取研究缺口清单（Task 3：Research Gap 识别）。
@@ -1310,11 +1454,11 @@ def list_research_gaps(project_id: str) -> dict:
     由 ResearchGapIdentifyAgent 在 cross_validate 之后生成并落库，
     每条 Gap 含类型（矛盾结论/未被探索方向/缺失知识连接）、
     证据链（可溯源 paper_id + snippet）、可操作性、优先级，
-    满足赛题「文献溯源完整性」要求，供前端「研究缺口」页展示。
+    满足「文献溯源完整性」要求，供前端「研究缺口」页展示。
     """
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         gaps = store.list_research_gaps(limit=200)
         stats = store.gap_stats()
     except Exception as e:  # noqa: BLE001
@@ -1357,7 +1501,7 @@ def list_research_conflicts(project_id: str) -> dict:
     """
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         conflicts = store.list_research_conflicts(limit=200)
         stats = store.conflict_stats()
     except Exception as e:  # noqa: BLE001
@@ -1509,55 +1653,24 @@ def adjudicate_conflict(project_id: str, conflict_id: str, req: ConflictAdjudica
         raise HTTPException(status_code=500, detail=f"裁决保存失败: {e}") from e
 
 
-@app.post("/api/projects/{project_id}/materials/re-extract")
-def re_extract_materials(project_id: str) -> dict:
-    """覆盖度重抽：对「仅名称」材料（无性能无合成）做针对性二次抽取补全。
-
-    仅名称材料是首轮抽取的召回遗漏（材料名出现但未抽到性能/合成）。
-    本接口跨论文聚合包含材料名的摘要片段，专门 prompt 补全其性能与合成。
-    异步执行（调用 LLM，可能耗时数十秒~数分钟），立即返回任务受理。
-    """
-    state = _require_project(project_id)
-    if state.status == "running":
-        raise HTTPException(status_code=409, detail="pipeline 正在运行中")
-
-    def _worker() -> None:
-        try:
-            store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-            from core.llm import LLMRegistry
-            from stages.research.agents import MaterialKnowledgeExtractionAgent
-            registry = LLMRegistry.from_config(_CONFIG)
-            agent = MaterialKnowledgeExtractionAgent("material_extraction")
-            n_added = agent._re_extract_name_only(store, registry)
-            mstats = store.material_stats()
-            state.error = None
-            state.summary = (
-                f"覆盖度重抽完成：补全 {n_added} 条知识"
-                f"（库内材料 {mstats['materials']} / 性能 {mstats['properties']} / "
-                f"合成 {mstats['synthesis']}）"
-            )
-        except Exception as e:  # noqa: BLE001
-            state.error = f"重抽失败: {type(e).__name__}: {e}"
-            state.summary = f"覆盖度重抽异常: {e}"
-
-    threading.Thread(target=_worker, daemon=True).start()
-    return {
-        "project_id": project_id,
-        "message": "覆盖度重抽已启动（异步执行），完成后可刷新材料页查看补全结果",
-    }
-
-
 @app.get("/api/projects/{project_id}/evidence")
-def list_evidence(project_id: str) -> dict:
+def list_evidence(project_id: str, limit: int = Query(10, ge=1, le=30), offset: int = Query(0, ge=0)) -> dict:
     """获取检索证据链（审计轨迹：query → source → 命中 → paper 关联）。
 
-    赛题手册明确要求文献调研可溯源：Sciverse 调用记录天然构成证据链。
+    文献调研可溯源：Sciverse 调用记录天然构成证据链。
     每条记录：触发子问题、数据源、命中证据标题、外部 ID（doc_id/arxiv_id）、
     证据分、片段摘要，以及是否关联到已入库论文。
     """
     _require_project(project_id)
+    if not _CONFIG.paths.project_db(project_id).is_file():
+        raise HTTPException(status_code=404, detail="项目数据库不存在，未创建空白数据替代历史项目")
+    from core.workspace.conversations import ConversationService
+    from core.workspace.read_model import search_audits
+    # Keep the old entries/stats contract while exposing the new task's own
+    # source calls and server-authored coverage. No migration or model call.
+    audit = search_audits(ConversationService(project_id, _CONFIG.paths.project_db(project_id)), limit=limit, offset=offset)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         entries = store.list_evidence(limit=500)
         stats = store.evidence_stats()
     except Exception as e:  # noqa: BLE001
@@ -1565,8 +1678,9 @@ def list_evidence(project_id: str) -> dict:
             "entries": [],
             "stats": {"total": 0, "by_source": {}, "linked": 0},
             "error": f"读取失败: {e}",
+            "conversation_search": audit,
         }
-    return {"entries": entries, "stats": stats}
+    return {"entries": entries, "stats": stats, "conversation_search": audit}
 
 
 @app.get("/api/projects/{project_id}/unlinked-papers")
@@ -1584,26 +1698,39 @@ def list_unlinked_papers(project_id: str) -> dict:
     """
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         entries = store.list_unlinked_evidence(limit=500)
         papers_all = store.list_papers()
     except Exception as e:  # noqa: BLE001
         return {"papers": [], "error": f"读取失败: {e}"}
 
-    # 已入库论文的 arxiv_id / title 集合（用于判定去重合并）
+    # 已入库论文的 arxiv_id / title / doc_id(S2/Sciverse) / DOI 集合（用于判定去重合并）
     paper_ax: set[str] = set()
     paper_titles: set[str] = set()
+    paper_doc_ids: set[str] = set()
+    paper_dois: set[str] = set()
     paper_id_by_ax: dict[str, str] = {}
     paper_id_by_title: dict[str, str] = {}
+    paper_id_by_doc: dict[str, str] = {}
+    paper_id_by_doi: dict[str, str] = {}
     for p in papers_all:
         ax = (p.arxiv_id or "").strip()
         tl = (p.title or "").strip().lower()
+        md = p.metadata or {}
+        doc = (md.get("doc_id") or "").strip()
+        doi = (p.doi or md.get("doi") or "").strip().lower()
         if ax:
             paper_ax.add(ax)
             paper_id_by_ax.setdefault(ax, p.paper_id)
         if tl:
             paper_titles.add(tl)
             paper_id_by_title.setdefault(tl, p.paper_id)
+        if doc:
+            paper_doc_ids.add(doc)
+            paper_id_by_doc.setdefault(doc, p.paper_id)
+        if doi:
+            paper_dois.add(doi)
+            paper_id_by_doi.setdefault(doi, p.paper_id)
 
     # 按 external_id（或 title）去重聚合：同一候选可能被多个子问题命中
     seen: dict[str, dict] = {}
@@ -1632,12 +1759,46 @@ def list_unlinked_papers(project_id: str) -> dict:
             if not seen[key]["snippet"]:
                 seen[key]["snippet"] = e.get("snippet", "")
 
-    # 判定每篇候选的未入库原因
+    # 二次去重：同一论文被多源命中（arXiv ID ≠ S2 ID）会生成两个 key，
+    # 按标题精确合并为一张候选卡，避免「未入库论文」列表出现重复项
+    def _is_arxiv_id(v: str) -> bool:
+        return bool(re.fullmatch(r"\d{4}\.\d{4,5}(v\d+)?", (v or "").strip()))
+
+    by_title: dict[str, dict] = {}
+    deduped: list[dict] = []
     for p in seen.values():
+        tkey = (p["title"] or "").strip().casefold()
+        hit = by_title.get(tkey) if tkey else None
+        if hit is None:
+            if tkey:
+                by_title[tkey] = p
+            deduped.append(p)
+            continue
+        # external_id 优先保留 arXiv ID（可直接还原 PDF 直链），S2/Sciverse ID 次之
+        if not hit["external_id"] or (
+            _is_arxiv_id(p["external_id"]) and not _is_arxiv_id(hit["external_id"])
+        ):
+            hit["external_id"] = p["external_id"]
+            hit["source"] = p["source"] or hit["source"]
+        hit["hit_count"] += p["hit_count"]
+        hit["log_ids"].extend(p["log_ids"])
+        hit["evidence_score"] = max(
+            float(hit["evidence_score"] or 0), float(p["evidence_score"] or 0)
+        )
+        if not hit["snippet"]:
+            hit["snippet"] = p["snippet"]
+
+    # 判定每篇候选的未入库原因
+    for p in deduped:
         ax = (p["external_id"] or "").strip()
         tl = (p["title"] or "").strip().lower()
-        if (ax and ax in paper_ax) or (tl and tl in paper_titles):
-            dup_pid = paper_id_by_ax.get(ax) or paper_id_by_title.get(tl, "")
+        dup_pid = (
+            paper_id_by_ax.get(ax)
+            or paper_id_by_title.get(tl, "")
+            or paper_id_by_doc.get(ax, "")
+            or paper_id_by_doi.get(ax.lower(), "")
+        )
+        if dup_pid:
             dup_title = next(
                 (pp.title for pp in papers_all if pp.paper_id == dup_pid),
                 "",
@@ -1646,16 +1807,15 @@ def list_unlinked_papers(project_id: str) -> dict:
             p["reason_detail"] = (
                 f"与已入库论文《{dup_title[:60]}》重复，去重时合并"
             )
-        else:
-            src = p["source"]
-            scorer = "Sciverse 语义检索分" if src == "sciverse" else "LLM 相关性评估分"
+        elif p["source"] == "sciverse" and 0 < float(p["evidence_score"] or 0) < 0.5:
             p["reason"] = "score_rejected"
-            p["reason_detail"] = (
-                f"相关性打分 < 0.5（{scorer}），被 filter 阶段剔除"
-            )
+            p["reason_detail"] = "Sciverse 证据分低于 0.5，未进入论文库"
+        else:
+            p["reason"] = "unlinked_unknown"
+            p["reason_detail"] = "检索命中尚未关联论文；可能仍在筛选、被去重，或筛选未完成，不能断言相关度低"
 
     papers = sorted(
-        seen.values(),
+        deduped,
         key=lambda p: (p["evidence_score"] or 0.0),
         reverse=True,
     )
@@ -1671,7 +1831,31 @@ def list_unlinked_papers(project_id: str) -> dict:
     }
 
 
+def _paper_identifiers_from_evidence(source: str, external_id: str) -> tuple[str, str, str, str]:
+    """从可信来源类型的外部 ID 还原 DOI/arXiv 与原文、PDF 地址。"""
+    source = (source or "").lower()
+    raw = (external_id or "").strip()
+    doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", raw, flags=re.I) if source == "crossref" else ""
+    if doi and not re.fullmatch(r"10\.\d{4,9}/\S+", doi, flags=re.I):
+        doi = ""
+    arxiv_id = ""
+    if source == "arxiv":
+        arxiv_id = re.sub(r"^https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/", "", raw, flags=re.I)
+        arxiv_id = re.sub(r"\.pdf$", "", arxiv_id, flags=re.I)
+        arxiv_id = re.sub(r"v\d+$", "", arxiv_id, flags=re.I)
+        if not re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})", arxiv_id, flags=re.I):
+            arxiv_id = ""
+    url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else (f"https://doi.org/{doi}" if doi else "")
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf" if arxiv_id else ""
+    if not doi and re.fullmatch(r"10\.\d{4,9}/\S+", raw, flags=re.I):
+        # 通用兜底：external_id 本身就是裸 DOI（如 openalex 等来源）
+        doi = raw
+        url = url or f"https://doi.org/{doi}"
+    return doi, arxiv_id, url, pdf_url
+
+
 @app.post("/api/projects/{project_id}/papers/import")
+@heavy_operation
 def import_unlinked_paper(project_id: str, body: dict) -> dict:
     """手动补录入库：将一条未关联证据候选正式入库为论文，并回填证据链关联。
 
@@ -1722,11 +1906,19 @@ def import_unlinked_paper(project_id: str, body: dict) -> dict:
     existing = None
     if (cand.get("external_id") or "").strip():
         existing = store.find_paper_by_external_id(cand["external_id"].strip())
+    if existing is None:
+        existing = next(
+            (p for p in store.list_papers()
+             if (p.title or "").strip().casefold() == (cand.get("title") or "").strip().casefold()),
+            None,
+        )
     if existing is not None:
         linked_count = 0
         for e in entries:
             eid = (e.get("external_id") or "").strip()
-            if external_id and eid and eid == external_id and e.get("log_id"):
+            etitle = (e.get("title") or "").strip().casefold()
+            if (eid and eid == (cand.get("external_id") or "").strip()
+                    or etitle and etitle == (cand.get("title") or "").strip().casefold()) and e.get("log_id"):
                 store.link_evidence_to_paper(e["log_id"], existing.paper_id)
                 linked_count += 1
         return {
@@ -1735,8 +1927,16 @@ def import_unlinked_paper(project_id: str, body: dict) -> dict:
             "message": f"该候选已存在同名论文，证据链已关联 {linked_count} 条到现有论文",
         }
 
-    # 新建论文（用证据链中的元数据）
+    # 新建论文（保留可核验外部标识，供原文跳转与 PDF 下载使用）
     paper_id = KnowledgeStore.new_id()
+    doi, arxiv_id, source_url, pdf_url = _paper_identifiers_from_evidence(
+        cand.get("source", ""), cand.get("external_id", "")
+    )
+    # 证据链若携带可核验标识（新检索写入 extra_json 的 doi/arxiv_id/url/pdf_url），优先使用
+    doi = (cand.get("doi") or "").strip() or doi
+    arxiv_id = (cand.get("arxiv_id") or "").strip() or arxiv_id
+    source_url = (cand.get("url") or "").strip() or source_url
+    pdf_url = (cand.get("pdf_url") or "").strip() or pdf_url
     snippet = body.get("snippet") or (cand.get("snippet") or "")
     # 清理前端渲染残留的 HTML 标签（手动补录时候选标题/片段可能带 <span class=highlight>）
     clean_title = re.sub(r"<[^>]+>", "", (cand.get("title") or title or "Untitled")).strip()
@@ -1746,10 +1946,15 @@ def import_unlinked_paper(project_id: str, body: dict) -> dict:
         paper_id=paper_id,
         title=clean_title,
         abstract=clean_snippet or None,
+        doi=doi or None,
+        arxiv_id=arxiv_id or None,
+        url=source_url or None,
         metadata={
             "source": cand.get("source", ""),
             "source_subquery": cand.get("subquery", ""),
             "doc_id": cand.get("external_id", ""),
+            "doi": doi,
+            "pdf_url": pdf_url,
             "evidence_score": cand.get("evidence_score", 0.0),
             "relevance_score": 0.0,
             "relevance_reason": "手动补录入库",
@@ -1790,14 +1995,17 @@ def import_unlinked_paper(project_id: str, body: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         logger.warning("手动补录证据链落库失败: %s", e)
 
-    # 回填证据链关联：该候选可能被多个子问题命中，全部关联
+    # 回填证据链关联：该候选可能被多个子问题命中，全部关联。
+    # 匹配口径与上方"已存在论文"分支一致：external_id 精确 或 标题一致（忽略大小写），
+    # 不再受请求参数是否携带限制（避免同论文不同 ID 命中的证据漏关联）。
+    cand_eid = (cand.get("external_id") or "").strip()
+    cand_title = (cand.get("title") or title or "").strip().casefold()
     linked_count = 0
     for e in entries:
         eid = (e.get("external_id") or "").strip()
-        etitle = (e.get("title") or "").strip().lower()
-        match = bool(external_id and eid and eid == external_id) or \
-            bool(not external_id and title and etitle == title.lower())
-        if match and e.get("log_id"):
+        etitle = (e.get("title") or "").strip().casefold()
+        if ((cand_eid and eid == cand_eid) or (cand_title and etitle == cand_title)) \
+                and e.get("log_id"):
             store.link_evidence_to_paper(e["log_id"], paper_id)
             linked_count += 1
 
@@ -1822,7 +2030,7 @@ def download_paper_pdf(project_id: str, paper_id: str):
     """
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id), initialize=False)
         try:
             paper = store.get_paper(paper_id)
         except Exception:  # noqa: BLE001
@@ -1833,20 +2041,33 @@ def download_paper_pdf(project_id: str, paper_id: str):
         raise HTTPException(status_code=404, detail="论文不存在")
 
     # 1. 已有本地文件 → 直接返回
-    if paper.pdf_path and os.path.exists(paper.pdf_path):
+    from core.storage_paths import project_file
+    local_pdf = project_file(paper.pdf_path, _CONFIG.paths.project_dir(project_id), data_root=_CONFIG.paths.root) if paper.pdf_path else None
+    if local_pdf is not None and local_pdf.is_file():
+        if _AUTH_MODE == "accounts" and not local_pdf.is_relative_to(
+            _CONFIG.paths.project_dir(project_id).resolve()
+        ):
+            raise HTTPException(404, "项目文件不存在")
         return FileResponse(
-            paper.pdf_path,
+            str(local_pdf),
             media_type="application/pdf",
             filename=f"{paper.paper_id}.pdf",
         )
 
+    return _fetch_paper_pdf(project_id, paper_id, paper, store)
+
+
+@heavy_operation
+def _fetch_paper_pdf(project_id, paper_id, paper, store):
+    from web.bounded_uploads import read_remote_bounded, RemoteFileTooLarge
     # 2. 解析目标 PDF URL
     meta = paper.metadata or {}
     pdf_url = (meta.get("pdf_url") or "").strip()
     if not pdf_url and paper.arxiv_id:
         pdf_url = f"https://arxiv.org/pdf/{paper.arxiv_id}.pdf"
-    if not pdf_url and paper.doi:
-        pdf_url = f"https://doi.org/{paper.doi}"
+    doi = paper.doi or meta.get("doi") or ""
+    if not pdf_url and doi:
+        pdf_url = f"https://doi.org/{doi}"
     if not pdf_url:
         # 最后手段：OpenAlex 按标题反查 DOI + OA PDF（仅在用户主动点击下载时联网）
         try:
@@ -1872,8 +2093,12 @@ def download_paper_pdf(project_id: str, paper_id: str):
                         metadata={**meta, "pdf_url": pdf_url, "doi": meta_tmp["doi"]},
                         source_stage=paper.source_stage, created_at=paper.created_at,
                     ))
+                except RemoteFileTooLarge:
+                    raise
                 except Exception:  # noqa: BLE001
                     pass
+        except RemoteFileTooLarge:
+            raise
         except Exception:  # noqa: BLE001
             pdf_url = ""
     if not pdf_url:
@@ -1897,8 +2122,7 @@ def download_paper_pdf(project_id: str, paper_id: str):
 
     def _download(url: str, timeout: int = 30) -> bytes:
         resp = _req.get(url, headers=headers, timeout=timeout, stream=True)
-        resp.raise_for_status()
-        return resp.content
+        return read_remote_bounded(resp)
 
     def _extract_pdf_from_html(html: bytes, base_url: str) -> str:
         """从出版商标注页解析真实 PDF 地址（citation_pdf_url / og:url 等）。"""
@@ -1940,11 +2164,13 @@ def download_paper_pdf(project_id: str, paper_id: str):
     candidates: list[str] = []
     candidates.append(pdf_url)
     # 若当前是 doi.org 兜底，先尝试 Unpaywall/OpenAlex 找 OA PDF 直链（force 绕过缓存）
-    if "doi.org" in pdf_url and paper.doi:
+    if "doi.org" in pdf_url and doi:
         try:
-            oa = find_open_access_pdf(paper.doi, title=paper.title or "", force=True)
+            oa = find_open_access_pdf(doi, title=paper.title or "", force=True)
             if oa and oa not in candidates:
                 candidates.append(oa)
+        except RemoteFileTooLarge:
+            raise
         except Exception:  # noqa: BLE001
             pass
 
@@ -1961,8 +2187,12 @@ def download_paper_pdf(project_id: str, paper_id: str):
                     content = _download(pdf_href)
                     if _is_pdf(content):
                         break
+                except RemoteFileTooLarge:
+                    raise
                 except Exception:  # noqa: BLE001
                     pass
+        except RemoteFileTooLarge:
+            raise
         except Exception as e:  # noqa: BLE001
             tried.append(f"{url} ({e})")
             content = b""
@@ -1986,6 +2216,8 @@ def download_paper_pdf(project_id: str, paper_id: str):
                     pdf_href = _extract_pdf_from_html(content, final_url)
                     if pdf_href:
                         content = _download(pdf_href)
+        except RemoteFileTooLarge:
+            raise
         except Exception:  # noqa: BLE001
             content = b""
 
@@ -2001,8 +2233,11 @@ def download_paper_pdf(project_id: str, paper_id: str):
     try:
         proj_dir = _CONFIG.paths.project_dir(project_id)
         pdf_dir = os.path.join(proj_dir, "papers")
+        if not Path(pdf_dir).resolve().is_relative_to(proj_dir.resolve()):
+            raise HTTPException(404, "项目文件不存在")
         os.makedirs(pdf_dir, exist_ok=True)
-        local_path = os.path.join(pdf_dir, f"{paper_id}.pdf")
+        safe_id = paper_id if re.fullmatch(r"[A-Za-z0-9_-]{1,120}", paper_id) else hashlib.sha256(paper_id.encode()).hexdigest()
+        local_path = os.path.join(pdf_dir, f"{safe_id}.pdf")
         with open(local_path, "wb") as f:
             f.write(content)
         # 回写 pdf_path（存 DB）
@@ -2024,8 +2259,12 @@ def download_paper_pdf(project_id: str, paper_id: str):
                 created_at=paper.created_at,
             )
             store.save_paper(_paper)
+        except RemoteFileTooLarge:
+            raise
         except Exception:  # noqa: BLE001
             pass  # 回写失败不影响本次下载
+    except RemoteFileTooLarge:
+        raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"保存 PDF 失败: {e}") from e
 
@@ -2040,7 +2279,7 @@ def download_paper_pdf(project_id: str, paper_id: str):
 def list_claims(project_id: str, status: Optional[str] = None) -> dict:
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         claims = store.list_claims()
     except Exception as e:  # noqa: BLE001
         return {"claims": [], "error": f"读取失败: {e}"}
@@ -2086,7 +2325,7 @@ def list_claims(project_id: str, status: Optional[str] = None) -> dict:
 def list_experiments(project_id: str) -> dict:
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         exps = store.list_experiments()
     except Exception as e:  # noqa: BLE001
         return {"experiments": [], "error": f"读取失败: {e}"}
@@ -2098,6 +2337,7 @@ def list_experiments(project_id: str) -> dict:
                 "status": e.status.value,
                 "verifies_claim_ids": e.verifies_claim_ids,
                 "config": e.config,
+                "metrics": e.metrics,
                 "result_summary": e.result_summary,
                 "anomaly_notes": e.anomaly_notes,
                 "started_at": e.started_at.isoformat() if e.started_at else None,
@@ -2107,6 +2347,258 @@ def list_experiments(project_id: str) -> dict:
             for e in exps
         ]
     }
+
+
+class RegenerateMethodDocRequest(BaseModel):
+    """重新生成方法文档请求（无必填参数）。"""
+
+    extra_hint: str = ""
+
+
+class ExperimentBackfillRequest(BaseModel):
+    """实验结果回填请求。
+
+    results_json：用户粘贴/上传的 results.json 内容（字符串），
+    结构 {"experiments": [{"name": ..., "metrics": {...}, "status": "success|failed|inconclusive"}]}。
+    """
+    results_json: str = Field(min_length=1, max_length=250000)
+
+
+_METHOD_REGEN_JOBS: dict[str, dict] = {}
+_METHOD_REGEN_LOCK = threading.Lock()
+
+
+@app.post("/api/projects/{project_id}/regenerate-method-doc")
+def regenerate_method_doc(project_id: str, req: Optional[RegenerateMethodDocRequest] = None) -> dict:
+    """重新生成方法文档（异步任务，立即返回）。
+
+    16384-token 的长文档生成经网关需数分钟，同步 HTTP 会超时——
+    因此改为后台线程生成，前端轮询 GET /method-doc-status 取结果。
+    """
+    state = _require_project(project_id)
+    _public_domain(state.domain)
+    with _METHOD_REGEN_LOCK:
+        job = _METHOD_REGEN_JOBS.get(project_id)
+        if job and job.get("status") == "running":
+            return {"project_id": project_id, "status": "running",
+                    "message": "已有重新生成任务进行中，请稍后用状态接口查询"}
+        if state.thread is not None and state.thread.is_alive():
+            raise HTTPException(status_code=409, detail="当前科研任务仍在运行，请在阶段结束后再生成方法修订稿")
+        lease = RESOURCES.acquire()
+        _METHOD_REGEN_JOBS[project_id] = {
+            "status": "running", "content": "", "message": "", "error": "",
+        }
+
+    def _run() -> None:
+        with _METHOD_REGEN_LOCK:
+            _METHOD_REGEN_JOBS[project_id] = {
+                "status": "running", "content": "", "message": "", "error": "",
+            }
+        try:
+            content = _generate_method_doc(project_id, (req.extra_hint if req else "") or "")
+            from core.knowledge import ArtifactType
+            am = _artifact_manager(project_id)
+            store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+            claims = store.list_claims()[:8]
+            previous = am.list_artifacts(ArtifactType.METHOD_DOC)
+            if previous:
+                artifact = am.new_version(previous[-1].artifact_group, content=content,
+                                          cites_claim_ids=[c.claim_id for c in claims], created_by="web_regenerate")
+            else:
+                artifact = am.create_artifact(artifact_type=ArtifactType.METHOD_DOC, title="方法文档",
+                                             content=content, cites_claim_ids=[c.claim_id for c in claims],
+                                             source_stage="design", created_by="web_regenerate")
+            with _METHOD_REGEN_LOCK:
+                _METHOD_REGEN_JOBS[project_id] = {
+                    "status": "done", "content": content, "artifact_id": artifact.artifact_id,
+                    "message": "方法修订稿已保存为新版本；请复核，未自动替换旧实验方案", "error": "",
+                }
+        except Exception as e:  # noqa: BLE001
+            with _METHOD_REGEN_LOCK:
+                _METHOD_REGEN_JOBS[project_id] = {
+                    "status": "failed", "content": "", "message": "",
+                    "error": str(e),
+                }
+
+    try:
+        threading.Thread(target=lease.worker(_run), daemon=True).start()
+    except BaseException:
+        lease.close()
+        with _METHOD_REGEN_LOCK:
+            _METHOD_REGEN_JOBS[project_id] = {"status":"failed", "error":"后台生成任务未能启动"}
+        raise HTTPException(status_code=503, detail="后台生成任务未能启动，请稍后重试")
+    return {"project_id": project_id, "status": "running",
+            "message": "重新生成已启动（约 3-6 分钟），请轮询状态接口"}
+
+
+def _generate_method_doc(project_id: str, hint: str) -> str:
+    """基于项目已有产物重建方法文档正文（供后台线程调用）。"""
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    state = _PROJECTS.get(project_id)
+    topic = str(store.get_kv("research.topic") or (state.topic if state else "") or "")
+
+    idea_texts = [i.text for i in store.list_ideas()[:3] if i.text]
+    claims = store.list_claims()
+    claim_lines = [f"- {c.statement}（状态：{c.status.value}）" for c in claims[:8]]
+    report = store.get_kv("cross_validation_report") or {}
+    consensus = [str(x) for x in (report.get("consensus") or [])[:5]]
+
+    prompt = (
+        f"研究主题：{topic}\n\n"
+        f"候选思路：\n" + ("\n".join(f"- {t[:300]}" for t in idea_texts) or "（无）") + "\n\n"
+        f"核心 Claim：\n" + ("\n".join(claim_lines) or "（无）") + "\n\n"
+        f"调研共识：\n" + ("\n".join(f"- {c}" for c in consensus) or "（无）") + "\n\n"
+        + (f"补充要求：{hint}\n\n" if hint else "")
+        + "请基于以上素材输出完整的方法文档（Markdown），包含：问题定义与符号表、"
+        "方法概述、与已有方法对比、核心公式设计（LaTeX）、算法伪代码、复杂度分析、"
+        "实验设计建议。素材缺失的小节请基于研究主题合理构造，不要输出空章节。"
+    )
+    registry = LLMRegistry.from_config(_CONFIG)
+    resp = None
+    for attempt in range(2):
+        resp = registry.complete(
+            task_type="design_method_formalize",
+            system=(
+                "你是科研方法形式化助手。基于给定素材整合完整方法文档，"
+                "输出 Markdown 格式，不得输出空内容或省略章节。" + MATH_DOCUMENT_GUIDE
+            ),
+            prompt=prompt,
+            # 推理模型经网关时 reasoning 也计入 max_tokens，2048 默认值
+            # 必然被思考耗尽（finish=length、content 空）——直接给足预算，
+            # 免去 registry 里"空内容→升级重试"浪费的一整轮等待。
+            max_tokens_override=16384,
+        )
+        if resp is not None and (resp.text or "").strip():
+            break
+    content = (resp.text if resp else "").strip()
+    if not content:
+        raise RuntimeError("模型连续返回空内容，请稍后重试")
+    return content
+
+
+@app.get("/api/projects/{project_id}/method-doc-status")
+def get_method_doc_status(project_id: str) -> dict:
+    """查询方法文档重新生成任务的状态（running/done/failed/idle）。"""
+    _require_project(project_id)
+    with _METHOD_REGEN_LOCK:
+        job = dict(_METHOD_REGEN_JOBS.get(project_id) or {})
+    job.setdefault("status", "idle")
+    return job
+
+
+@app.get("/api/projects/{project_id}/experiment-tasks")
+def get_experiment_tasks(project_id: str) -> dict:
+    """读取实验任务包（README 任务说明书 + 规划清单），供前端实验页展示。"""
+    _require_project(project_id)
+    exp_dir = _CONFIG.paths.project_dir(project_id) / "experiments"
+    readme_path = exp_dir / "README.md"
+    plan_path = exp_dir / "experiment_plan.json"
+    readme = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
+    plan: dict = {}
+    if plan_path.exists():
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception:
+            plan = {}
+    return {
+        "has_tasks": bool(readme),
+        "readme": readme,
+        "plan": plan,
+        "export_dir": str(exp_dir),
+    }
+
+
+@app.post("/api/projects/{project_id}/experiments/backfill")
+def backfill_experiment_results(project_id: str, req: ExperimentBackfillRequest) -> dict:
+    _require_project(project_id)
+    raise HTTPException(status_code=422,detail=NOTICE)
+
+
+def _backfill_experiment_results_internal(project_id: str, req: ExperimentBackfillRequest) -> dict:
+    """回填实验结果：解析 results.json 结构，按 name 匹配更新实验状态与指标。
+
+    status 映射：success → completed，failed → failed，inconclusive → anomaly_detected。
+    """
+    state = _require_project(project_id)
+    if state.thread is not None and state.thread.is_alive():
+        raise HTTPException(status_code=409, detail="当前任务仍在运行或等待确认，请在实验规划结束后回填结果")
+    raw = (req.results_json or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="results_json 不能为空")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"JSON 解析失败: {e}")
+    items = data.get("experiments") if isinstance(data, dict) else data
+    if not isinstance(items, list) or not items:
+        raise HTTPException(
+            status_code=400,
+            detail='格式应为 {"experiments": [{"name": ..., "metrics": {...}, "status": "success"}]}',
+        )
+
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    existing = store.list_experiments()
+    by_id = {e.experiment_id: e for e in existing}
+    updated, pending, seen = [], [], set()
+    status_map = {
+        "success": ExperimentStatus.COMPLETED,
+        "completed": ExperimentStatus.COMPLETED,
+        "failed": ExperimentStatus.FAILED,
+        "inconclusive": ExperimentStatus.ANOMALY_DETECTED,
+    }
+    if len(items) > 100:
+        raise HTTPException(status_code=422, detail="单次最多回填 100 条实验结果")
+    for index, item in enumerate(items, 1):
+        try:
+            submitted = SubmittedResult.model_validate(item)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=f"第 {index} 条结果无效：{exc.errors()[0]['msg']}；本批未保存") from exc
+        matches = [e for e in existing if e.name == submitted.name.strip()]
+        exp = by_id.get(submitted.experiment_id) if submitted.experiment_id else (matches[0] if len(matches) == 1 else None)
+        if exp is None:
+            reason = "名称重复，请指定 experiment_id" if len(matches) > 1 else "不存在对应实验"
+            raise HTTPException(status_code=422, detail=f"第 {index} 条{reason}；本批未保存")
+        if submitted.experiment_id and submitted.name and submitted.name.strip() != exp.name:
+            raise HTTPException(status_code=422, detail=f"第 {index} 条任务编号与名称不一致；本批未保存")
+        if exp.experiment_id in seen:
+            raise HTTPException(status_code=422, detail="同一批不能重复提交同一个实验；本批未保存")
+        seen.add(exp.experiment_id)
+        if not set(submitted.claim_assessments) <= set(exp.verifies_claim_ids):
+            raise HTTPException(status_code=422, detail="判断中包含本实验未关联的论断；本批未保存")
+        exp = exp.model_copy(deep=True)
+        exp.status = status_map[submitted.status]
+        exp.metrics = submitted.metrics
+        exp.completed_at = datetime.now()
+        exp.config["user_claim_assessments"] = submitted.claim_assessments
+        exp.anomaly_notes = submitted.summary if submitted.status in ("failed", "inconclusive") else None
+        exp.result_summary = (
+            f"用户提交，未经系统独立复现：status={submitted.status}，"
+            f"metrics={json.dumps(exp.metrics, ensure_ascii=False)}\n{submitted.summary}"
+        )
+        pending.append(exp)
+        updated.append(exp.name)
+
+    with _LOCK:
+        if state.thread is not None and state.thread.is_alive():
+            raise HTTPException(status_code=409, detail="科研任务已启动，本次结果尚未保存，请等待任务结束后重试")
+        store.save_experiments_batch(pending)
+    state.summary = f"已保存 {len(updated)} 条用户实验结果。点击继续运行复核结果，不会重新生成实验任务。"
+    if state.status == "completed":
+        store.save_kv("writing.results_need_review", True)
+        state.summary = "结果已更新，原稿件保留但需要核对修订；系统不会把旧稿自动当作新结果的结论。"
+
+    return {
+        "updated": updated,
+        "unmatched": [],
+        "message": state.summary,
+    }
+
+
+def _merged_project_notes(store: KnowledgeStore, state: ProjectState) -> list[dict]:
+    """状态计数和笔记列表使用相同的持久化/内存去重口径，不修改存储。"""
+    saved = store.get_kv("user.notes") or []
+    known = {note["note_id"] for note in saved}
+    return saved + [note for note in state.notes if note["note_id"] not in known]
 
 
 @app.post("/api/projects/{project_id}/notes")
@@ -2121,22 +2613,34 @@ def add_note(project_id: str, req: NoteRequest) -> dict:
         "created_at": datetime.utcnow().isoformat(),
         "created_at": datetime.now().isoformat(),
     }
-    state.notes.append(note)
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    notes = _merged_project_notes(store, state)
+    notes.append(note)
+    store.save_kv("user.notes", notes)
+    state.notes = notes
     return {"note": note}
 
 
 @app.get("/api/projects/{project_id}/notes")
 def list_notes(project_id: str) -> dict:
     state = _require_project(project_id)
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
+    state.notes = _merged_project_notes(store, state)
     return {"notes": list(state.notes)}
 
 
 @app.post("/api/projects/{project_id}/human-response")
 def submit_human_response(project_id: str, req: HumanResponseRequest) -> dict:
     state = _require_project(project_id)
+    boundary=inspect_boundary(_CONFIG.paths,project_id,pending=_BRIDGE.get_pending(project_id),observed_status=state.status,observed_history=state.node_history)
+    if boundary["restricted"]:
+        raise HTTPException(status_code=422,detail=boundary["message"])
     action = req.action or "continue"
     if action not in ("continue", "abort", "rollback"):
         raise HTTPException(status_code=400, detail="action 必须为 continue/abort/rollback")
+    pending = _BRIDGE.get_pending(project_id)
+    if req.expected_node_id and (pending or {}).get("context", {}).get("node_id") != req.expected_node_id:
+        raise HTTPException(status_code=409, detail="人工节点已变化，请刷新页面后重新确认")
     resp = HumanResponse(
         text=req.text,
         selected_option=req.selected_option,
@@ -2146,6 +2650,7 @@ def submit_human_response(project_id: str, req: HumanResponseRequest) -> dict:
     if req.search_prefs:
         resp.context = {"search_prefs": req.search_prefs}
         state.search_prefs = dict(req.search_prefs)
+        KnowledgeStore(_CONFIG.paths.project_db(project_id)).save_kv("web.search_prefs", state.search_prefs)
     ok = _BRIDGE.submit(project_id, resp)
     if not ok:
         # 没有等待中的人工请求：可能已提交、已超时、被清除，或多实例分裂
@@ -2159,25 +2664,25 @@ def submit_human_response(project_id: str, req: HumanResponseRequest) -> dict:
     return {"project_id": project_id, "submitted": True, "action": action}
 
 
-# ===== 赛题对齐展示接口 =====
+# ===== 调研报告接口 =====
 
 
 @app.get("/api/projects/{project_id}/research-report")
 def get_research_report(project_id: str) -> dict:
-    """文献调研报告（赛题基本任务核心产出）。
+    """文献调研报告（research 阶段核心产出）。
 
     返回 cross_validation_report，含 Research Gaps / 共识 / 冲突 / 整体置信度。
     """
     _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         cv_report = store.get_kv("cross_validation_report")
     except Exception as e:  # noqa: BLE001
         return {"report": None, "error": f"读取失败: {e}"}
     if not cv_report:
         return {
             "report": None,
-            "message": "尚未生成调研报告，请先运行 research 阶段（启动 Pipeline 或构效关系发现）",
+            "message": "尚未生成调研报告，请先运行 research 阶段（启动 Pipeline）",
         }
     # 补充论文计数
     try:
@@ -2191,350 +2696,47 @@ def get_research_report(project_id: str) -> dict:
     }
 
 
-@app.get("/api/projects/{project_id}/discovery-detail")
-def get_discovery_detail(project_id: str) -> dict:
-    """构效关系发现详细数据（路线 A 完整产出）。
-
-    返回：
-    - discovery_summary: 计数卡片
-    - discovery_hypotheses: 假设列表
-    - discovery_search_space: 搜索空间定义
-    - discovery_relationships: 验证后的构效关系（含交叉验证结果）
-    - discovery_search_trace: MCTS 搜索轨迹（前端可视化）
-    - discovery_literature_points: 文献数据点（前端散点图）
-    - discovery_report_content: Markdown 报告
-    - materials_cross_validation_report: Materials Project 交叉验证报告
-    """
-    _require_project(project_id)
-    try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-        kv = store.list_kv()
-    except Exception as e:  # noqa: BLE001
-        return {"error": f"读取失败: {e}"}
-    # 也补充 Claim 形式的发现（兼容旧项目）
-    relationships_from_claims: list[dict] = []
-    try:
-        for c in store.list_claims():
-            if c.source_stage == "discovery":
-                relationships_from_claims.append({
-                    "claim_id": c.claim_id,
-                    "statement": c.statement,
-                    "status": c.status.value,
-                    "evidence_refs": c.evidence_refs,
-                    "created_at": c.created_at.isoformat() if c.created_at else None,
-                })
-    except Exception:  # noqa: BLE001
-        pass
-    kv_relationships = kv.get("discovery_relationships", [])
-    # 优先用 KV 完整版（含 cross_validation 字段），无则用 Claim 版
-    relationships = kv_relationships if kv_relationships else relationships_from_claims
-    return {
-        "project_id": project_id,
-        "discovery_summary": kv.get("discovery_summary", {}),
-        "discovery_hypotheses": kv.get("discovery_hypotheses", []),
-        "discovery_search_space": kv.get("discovery_search_space", {}),
-        "discovery_relationships": relationships,
-        "discovery_search_trace": kv.get("discovery_search_trace", {}),
-        "discovery_literature_points": kv.get("discovery_literature_points", []),
-        "discovery_symbolic_regression": kv.get("discovery_symbolic_regression", {}),
-        "discovery_surrogate_calibration": kv.get("discovery_surrogate_calibration", {}),
-        "discovery_report_content": kv.get("discovery_report_content", ""),
-        "discovery_report_artifact_id": kv.get("discovery_report_artifact_id", ""),
-        "materials_cross_validation_report": kv.get("materials_cross_validation_report", {}),
-    }
-
-
-@app.get("/api/projects/{project_id}/materials-cross-validation")
-def get_materials_cross_validation(project_id: str) -> dict:
-    """Materials Project 交叉验证报告（赛题路线 A 硬要求）。"""
-    _require_project(project_id)
-    try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-        report = store.get_kv("materials_cross_validation_report")
-    except Exception as e:  # noqa: BLE001
-        return {"report": None, "error": f"读取失败: {e}"}
-    if not report:
-        return {
-            "report": None,
-            "message": "尚未生成交叉验证报告，请先运行构效关系发现",
-        }
-    return {"project_id": project_id, "report": report}
-
-
-@app.get("/api/projects/{project_id}/download/cross-validation")
-def download_cross_validation(project_id: str, format: str = "md") -> Response:
-    """下载 Materials Project 交叉验证报告（赛题路线 A 硬要求可提交材料）。
-
-    支持 md / docx / pdf 三种格式（与 download_artifact 一致）。
-    """
-    _require_project(project_id)
-    try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-        report = store.get_kv("materials_cross_validation_report") or {}
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"读取交叉验证报告失败: {e}")
-    md_content = _build_materials_cv_md(report, project_id)
-    base_filename = "materials_cross_validation"
-    fmt = (format or "md").lower()
-    if fmt == "docx":
-        return _md_to_docx_response(md_content, base_filename)
-    elif fmt == "pdf":
-        return _md_to_pdf_response(md_content, base_filename)
-    return _make_download(md_content, f"{base_filename}.md", "text/markdown", "md")
-
-
-def _build_materials_cv_md(report: dict, project_id: str) -> str:
-    """Materials Project 交叉验证报告 → 可提交 Markdown（直接贴 §4.2 当前结果）。"""
-    from core.tools import data_sources_to_markdown
-
-    parts: list[str] = []
-    parts.append("# Materials Project 交叉验证报告\n\n")
-    parts.append(f"**项目 ID**: `{project_id}`\n\n")
-    parts.append(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
-    parts.append("---\n\n")
-
-    if not report:
-        parts.append("> 尚未生成交叉验证报告，请先运行构效关系发现。\n\n")
-        return "".join(parts)
-
-    # 顶部摘要
-    parts.append("## 摘要\n\n")
-    parts.append(f"- 验证发现总数: **{report.get('total_discoveries', 0)}**\n")
-    parts.append(f"- Materials Project API 命中: **{report.get('mp_validated', 0)}**\n")
-    parts.append(f"- 规则交叉验证通过: **{report.get('rule_validated', 0)}**\n")
-    parts.append(f"- 整体置信度: **{report.get('overall_confidence', 0):.3f}**\n")
-    src = report.get("source", "")
-    src_text = {
-        "mp": "Materials Project API + 规则双路",
-        "rule": "规则交叉验证（未配置 MP API key）",
-        "hybrid": "Materials Project API + 规则（混合）",
-    }.get(src, src or "未知")
-    parts.append(f"- 验证来源: **{src_text}**\n\n")
-
-    # 验证来源说明
-    notes = report.get("notes") or ""
-    if notes:
-        parts.append("## 验证方法说明\n\n")
-        parts.append(f"{notes}\n\n")
-        parts.append("> 配置 `MATERIALS_PROJECT_API_KEY` 环境变量可启用 Materials Project 数据库交叉验证。"
-                     "申请地址：https://next-gen.materialsproject.org/api\n\n")
-
-    # 逐条详情
-    results = report.get("results") or []
-    parts.append(f"## 逐条验证详情（{len(results)} 条）\n\n")
-    if not results:
-        parts.append("> 无验证详情。\n\n")
-    else:
-        parts.append("| # | 材料 | Novelty | MP 命中 | MP 带隙 | 规则通过 | 一致性 | 综合置信度 | 来源 |\n")
-        parts.append("|---|---|---|---|---|---|---|---|---|\n")
-        for i, r in enumerate(results, 1):
-            cells = [
-                str(i),
-                str(r.get("material") or "未识别"),
-                str(r.get("novelty") or "unknown"),
-                "✓" if r.get("mp_match") else "—",
-                f"{r.get('mp_band_gap'):.3g}" if isinstance(r.get("mp_band_gap"), (int, float)) else "—",
-                "✓" if r.get("rule_check_passed") else "—",
-                "✓" if r.get("literature_consistent") else "—",
-                f"{float(r.get('confidence', 0)):.3f}",
-                str(r.get("cross_validation_source") or "rule"),
-            ]
-            parts.append("| " + " | ".join(cells) + " |\n")
-        parts.append("\n")
-
-        # 展开每条的 rule_check_notes（评委可读性更强）
-        parts.append("### 规则检查备注（逐条）\n\n")
-        for i, r in enumerate(results, 1):
-            mat = r.get("material") or "未识别"
-            note = r.get("rule_check_notes") or "(无备注)"
-            parts.append(f"- **#{i} {mat}** — {note}\n")
-        parts.append("\n")
-
-    # 附录：合规披露引用
-    parts.append("---\n\n## 附录：外部数据源合规披露\n\n")
-    parts.append("本系统使用的所有外部数据源、许可证与降级策略详见方案文档 §5.3，"
-                 "集中登记表见 `core/tools/data_provenance.py`。摘要如下：\n\n")
-    parts.append(data_sources_to_markdown() + "\n")
-    return "".join(parts)
-
-
-@app.get("/api/projects/{project_id}/method-alignment")
-def get_method_alignment(project_id: str) -> dict:
-    """方法↔代码对齐（公式 LaTeX ↔ 实验代码关键词匹配）。
-
-    从方法 Artifact 抽取 LaTeX 公式，与实验代码做关键词匹配，
-    标注 mapped / partial / missing。
-    """
-    _require_project(project_id)
-    try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-        # 方法 Artifact
-        method_content = ""
-        method_artifacts: list[dict] = []
-        for art in store.list_artifact_versions("") if hasattr(store, "list_artifact_versions") else []:
-            method_artifacts.append({"artifact_id": art.artifact_id, "title": art.title})
-        # 简化版：扫描所有 METHOD_DOC 类型 Artifact
-        try:
-            with store._connect() as conn:  # type: ignore[attr-defined]
-                rows = conn.execute(
-                    "SELECT artifact_id, content FROM artifacts WHERE artifact_type = 'method_doc' ORDER BY created_at DESC LIMIT 5"
-                ).fetchall()
-                method_artifacts = [
-                    {"artifact_id": r["artifact_id"], "content": r["content"][:5000]}
-                    for r in rows
-                ]
-                if rows:
-                    method_content = rows[0]["content"]
-        except Exception:  # noqa: BLE001
-            pass
-        # 实验代码（取最近实验的 config，可能含代码片段）
-        experiments = store.list_experiments()
-        experiment_code_snippets: list[dict] = []
-        for exp in experiments[:5]:
-            experiment_code_snippets.append({
-                "experiment_id": exp.experiment_id,
-                "name": exp.name,
-                "status": exp.status.value,
-                "config_keys": list(exp.config.keys()) if exp.config else [],
-                "result_summary": exp.result_summary,
-            })
-    except Exception as e:  # noqa: BLE001
-        return {"error": f"读取失败: {e}"}
-
-    # 简化版对齐：从 method_content 抽取 LaTeX 公式标记
-    import re
-    formulas: list[dict] = []
-    if method_content:
-        # 抽取 $$...$$ / \[...\] / equation 环境的公式
-        formula_patterns = [
-            (r"\$\$(.+?)\$\$", "display"),
-            (r"\\\[(.+?)\\\]", "display"),
-            (r"\\begin\{equation\}(.+?)\\end\{equation\}", "display"),
-            (r"\$([^$\n]+?)\$", "inline"),
-        ]
-        seen = set()
-        for pat, kind in formula_patterns:
-            for m in re.finditer(pat, method_content, re.DOTALL):
-                f = m.group(1).strip()
-                if f and f not in seen and len(f) < 500:
-                    seen.add(f)
-                    # 关键词匹配：在实验代码片段中查找公式变量
-                    keywords = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", f)
-                    keywords = [k for k in keywords if len(k) > 2 and k not in
-                                ("frac", "sum", "int", "mathrm", "text", "left", "right",
-                                 "begin", "end", "alpha", "beta", "gamma", "delta", "theta",
-                                 "lambda", "mu", "sigma", "phi", "psi", "omega")]
-                    matched_kw = []
-                    for kw in keywords[:10]:
-                        for exp in experiments:
-                            cfg_str = str(exp.config or "")
-                            if kw in cfg_str:
-                                matched_kw.append(kw)
-                                break
-                    status = "mapped" if matched_kw else (
-                        "partial" if keywords else "missing"
-                    )
-                    formulas.append({
-                        "formula": f,
-                        "kind": kind,
-                        "keywords": keywords[:10],
-                        "matched_keywords": matched_kw,
-                        "alignment_status": status,
-                    })
-    return {
-        "project_id": project_id,
-        "method_artifacts": method_artifacts,
-        "method_content_preview": method_content[:2000] if method_content else "",
-        "experiment_code_snippets": experiment_code_snippets,
-        "formulas": formulas,
-        "alignment_summary": {
-            "total_formulas": len(formulas),
-            "mapped": sum(1 for f in formulas if f["alignment_status"] == "mapped"),
-            "partial": sum(1 for f in formulas if f["alignment_status"] == "partial"),
-            "missing": sum(1 for f in formulas if f["alignment_status"] == "missing"),
-        },
-    }
-
-
 @app.get("/api/projects/{project_id}/dashboard")
 def get_dashboard(project_id: str) -> dict:
-    """首页 Dashboard 聚合数据（赛题对齐展示）。
+    """首页 Dashboard 聚合数据。
 
-    一次返回所有计数 + 调研报告摘要 + 发现摘要 + 交叉验证摘要，
-    让前端 Dashboard 单次拉取即可渲染。
+    一次返回所有计数 + 调研报告摘要，让前端 Dashboard 单次拉取即可渲染。
     """
     state = _require_project(project_id)
     try:
-        store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+        store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
         counts = {
             "papers": len(store.list_papers()),
             "ideas": len(store.list_ideas()),
             "claims": len(store.list_claims()),
             "experiments": len(store.list_experiments()),
-            "discovery_claims": sum(
-                1 for c in store.list_claims() if c.source_stage == "discovery"
-            ),
+            "gaps": store.gap_stats()["total"],
         }
         cv_report = store.get_kv("cross_validation_report") or {}
-        discovery_summary = store.get_kv("discovery_summary") or {}
-        materials_cv = store.get_kv("materials_cross_validation_report") or {}
     except Exception as e:  # noqa: BLE001
         return {"error": f"读取失败: {e}"}
 
     # 方法对齐摘要（公式数）
-    method_alignment_summary = {"total_formulas": 0}
-    try:
-        from core.artifacts import ArtifactManager as _AM
-        from core.knowledge import ArtifactType
-        am = _AM(_CONFIG.paths.project_db(project_id))
-        # 统计 FORMULA + METHOD_DOC 类型产出
-        total_formulas = 0
-        for at in (ArtifactType.FORMULA, ArtifactType.METHOD_DOC):
-            try:
-                arts = am.list_artifacts(artifact_type=at)
-                for a in arts:
-                    content = a.content or {}
-                    if isinstance(content, dict):
-                        formulas = content.get("formula_code_map") or content.get("formulas") or []
-                        total_formulas += len(formulas) if isinstance(formulas, list) else 0
-                    else:
-                        total_formulas += 1
-            except Exception:  # noqa: BLE001
-                pass
-        method_alignment_summary["total_formulas"] = total_formulas
-    except Exception:  # noqa: BLE001
-        pass
-
     # 论文写作摘要
     writing_summary = {"artifact_count": 0}
     try:
-        from core.artifacts import ArtifactManager as _AM
-        from core.knowledge import ArtifactType
-        am = _AM(_CONFIG.paths.project_db(project_id))
-        art_count = 0
-        for wt in (ArtifactType.PAPER_DRAFT, ArtifactType.REVIEW_NOTE):
-            try:
-                art_count += len(am.list_artifacts(artifact_type=wt))
-            except Exception:  # noqa: BLE001
-                pass
-        writing_summary["artifact_count"] = art_count
+        writing_summary["artifact_count"] = _writing_artifact_count(store)
     except Exception:  # noqa: BLE001
         pass
 
     # 阶段状态
     stage_statuses: dict[str, str] = {}
     current_stage = ""
-    try:
-        session = ProjectSession.load(project_id, _CONFIG.paths)
-        current_stage = session.current_stage().value
-        for stage in LifecycleStage.ordered():
-            stage_statuses[stage.value] = session.status_of(stage).value
-    except Exception:  # noqa: BLE001
-        pass
+    boundary = inspect_boundary(_CONFIG.paths,project_id)
+    current_stage = historical_stage(boundary)
+    stage_statuses = {s.value:boundary["stage_statuses"].get(s.value,"not_started") for s in LifecycleStage.ordered()}
 
+    workflow = _workspace_workflow(state,store,stage_statuses)
+    counts["writing_artifacts"] = writing_summary["artifact_count"]
     return {
         "project_id": project_id,
         "topic": state.topic,
+        "domain": state.domain,
         "status": state.status,
         "summary": state.summary,
         "recommendation": state.recommendation,
@@ -2548,17 +2750,13 @@ def get_dashboard(project_id: str) -> dict:
             "conflicts_count": len(cv_report.get("conflicts", [])),
             "overall_confidence": cv_report.get("overall_confidence", 0),
         },
-        "discovery_summary": discovery_summary,
-        "materials_cv_summary": {
-            "total_discoveries": materials_cv.get("total_discoveries", 0),
-            "mp_validated": materials_cv.get("mp_validated", 0),
-            "rule_validated": materials_cv.get("rule_validated", 0),
-            "overall_confidence": materials_cv.get("overall_confidence", 0),
-            "source": materials_cv.get("source", ""),
-        },
-        "method_alignment_summary": method_alignment_summary,
         "writing_summary": writing_summary,
         "pending_human": _BRIDGE.get_pending(project_id),
+        "product_stage":workflow["product_stage"],
+        "product_boundary":workflow["product_boundary"],
+        "continuation": workflow["continuation"],
+        "workflow": workflow,
+        "run_mode": state.run_mode,
     }
 
 
@@ -2566,13 +2764,13 @@ def get_dashboard(project_id: str) -> dict:
 
 
 @app.get("/api/projects/{project_id}/download/{artifact_type}")
-def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
+def download_artifact(project_id: str, artifact_type: str, format: str = "md", preserve_status: bool = False):
     """下载关键产出物，支持 md / docx / pdf 三种格式。
 
     支持类型：
     - research-report：文献调研报告
-    - discovery-report：构效关系发现报告
-    - experiment-code：实验代码（仅 md/py 格式）
+    - discovery-report：关系发现报告
+    - experiment-tasks：实验任务说明书（experiment-code 为兼容别名）
     - experiment-results：实验结果（含 metrics）
     - method-doc：方法文档
     - paper-draft：论文稿
@@ -2581,18 +2779,24 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
     - full-report：全流程综合报告
     """
     _require_project(project_id)
-    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=True)
 
-    # 实验代码仅支持原文下载（py 格式）
-    if artifact_type == "experiment-code":
+    # 实验任务说明书（系统不交付代码，交付物为任务说明书）
+    if artifact_type in ("experiment-tasks", "experiment-code"):
         exp_dir = _CONFIG.paths.project_dir(project_id) / "experiments"
-        code_path = exp_dir / "run_exp.py"
-        if code_path.exists():
-            code = code_path.read_text(encoding="utf-8")
+        readme_path = exp_dir / "README.md"
+        if _AUTH_MODE == "accounts" and not readme_path.resolve().is_relative_to(_CONFIG.paths.project_dir(project_id).resolve()):
+            raise HTTPException(404, "项目文件不存在")
+        if readme_path.exists():
+            md_content = readme_path.read_text(encoding="utf-8")
         else:
-            exps = store.list_experiments()
-            code = f"# 无 run_exp.py，共有 {len(exps)} 条实验记录"
-        return _make_download(code, "run_exp.py", "text/x-python", "md")
+            md_content = (
+                "# 实验任务说明书\n\n> 尚未导出实验任务包，请先运行 experiment 阶段"
+                "并在人工审核节点确认导出。"
+            )
+        if preserve_status:
+            md_content = _download_status_note(store, project_id, artifact_type) + md_content
+        return _make_download(md_content, "experiment_tasks.md", "text/markdown", format)
 
     # 其余类型先统一生成 Markdown 内容
     md_content = ""
@@ -2600,14 +2804,28 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
 
     if artifact_type == "research-report":
         report = store.get_kv("cross_validation_report") or {}
-        md_content = _build_research_report_md(report)
+        md_content = _build_research_report_md(report, store)
         base_filename = "research_report"
 
     elif artifact_type == "discovery-report":
         content = store.get_kv("discovery_report_content") or ""
+        content = strip_think_tags(content)
         if not content:
             summary = store.get_kv("discovery_summary") or {}
-            content = f"# 构效关系发现报告\n\n{json.dumps(summary, ensure_ascii=False, indent=2)}"
+            if summary:
+                content = (
+                    "# 关系发现报告\n\n"
+                    f"- 候选假设数：{summary.get('hypotheses', 0)}\n"
+                    f"- 验证发现数：{summary.get('relationships', 0)}\n"
+                    f"- 其中新颖发现：{summary.get('novel', 0)}\n\n"
+                    "> 报告正文尚未生成（LLM 生成失败或 discovery_report 节点未运行），"
+                    "以上为结构化摘要。"
+                )
+            else:
+                content = (
+                    "# 关系发现报告\n\n"
+                    "> 尚未生成发现报告，请先运行「关系发现」流程。"
+                )
         md_content = content
         base_filename = "discovery_report"
 
@@ -2615,28 +2833,34 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
         try:
             from core.artifacts import ArtifactManager
             from core.knowledge import ArtifactType
-            am = ArtifactManager(_CONFIG.paths.project_db(project_id))
+            am = _artifact_manager(project_id,read_only=True)
             arts = am.list_artifacts(artifact_type=ArtifactType.METHOD_DOC)
             if arts:
-                md_content = am.read_content(arts[0]) or str(arts[0].content or "")
+                md_content = am.read_content(arts[-1]) or ""
+                if not md_content.strip():
+                    md_content = (
+                        "# 方法文档为空\n\n"
+                        "> 生成时模型返回了空内容。请在项目主页点击「重新生成方法文档」，"
+                        "系统会基于已有调研产物重建并保存新版本。"
+                    )
             else:
-                md_content = "# 无方法文档"
+                md_content = "# 暂无方法文档\n\n> 尚未生成方法设计文档，请先运行 design 阶段。"
         except Exception:
-            md_content = "# 无方法文档"
+            md_content = "# 暂无方法文档\n\n> 尚未生成方法设计文档，请先运行 design 阶段。"
         base_filename = "method_doc"
 
     elif artifact_type == "paper-draft":
         try:
             from core.artifacts import ArtifactManager
             from core.knowledge import ArtifactType
-            am = ArtifactManager(_CONFIG.paths.project_db(project_id))
+            am = _artifact_manager(project_id,read_only=True)
             arts = am.list_artifacts(artifact_type=ArtifactType.PAPER_DRAFT)
             if arts:
-                md_content = am.read_content(arts[0]) or str(arts[0].content or "")
+                md_content = am.read_content(arts[-1]) or str(arts[-1].content or "")
             else:
-                md_content = "# 无论文稿"
+                md_content = "# 暂无 论文稿\n\n> 尚未生成论文稿，请先运行 writing 阶段。"
         except Exception:
-            md_content = "# 无论文稿"
+            md_content = "# 暂无 论文稿\n\n> 尚未生成论文稿，请先运行 writing 阶段。"
         base_filename = "paper_draft"
 
     elif artifact_type == "claims-summary":
@@ -2658,6 +2882,8 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
     else:
         raise HTTPException(status_code=400, detail=f"不支持的下载类型: {artifact_type}")
 
+    if preserve_status:
+        md_content = _download_status_note(store, project_id, artifact_type) + md_content
     # 按格式转换
     fmt = (format or "md").lower()
     if fmt == "docx":
@@ -2668,39 +2894,277 @@ def download_artifact(project_id: str, artifact_type: str, format: str = "md"):
         return _make_download(md_content, f"{base_filename}.md", "text/markdown", "md")
 
 
-def _build_research_report_md(report: dict) -> str:
-    """把 cross_validation_report 转为 Markdown。"""
-    md = "# 文献调研报告\n\n"
-    md += f"**综合置信度**: {report.get('overall_confidence', 0):.2f}\n\n"
+def _download_status_note(store, project_id, kind):
+    historical = kind in ("experiment-tasks", "experiment-code", "experiment-results", "paper-draft", "claims-summary", "discovery-report")
+    note = f"# 导出说明\n\n项目：{project_id}\n\n状态：{'历史产物，非本轮新增成果' if historical else '已有研究材料，尚待审阅'}\n\n> 本轮止于研究方案，保存、汇总及下载不表示已执行实验或结论得到验证。\n\n"
+    fields = ("mode", "status", "data_mode", "run_mode", "dry_run", "is_demo", "demo", "is_teaching", "case_id", "simulated", "needs_review", "result_origin", "provenance")
+    sources = []
+    if kind == "research-report":
+        sources.append(store.get_kv("cross_validation_report") or {})
+    if kind == "experiment-results":
+        sources.extend(e.config for e in store.list_experiments())
+    for source in sources:
+        if isinstance(source, dict):
+            markers = {key:source[key] for key in fields if key in source}
+            if markers:
+                note += "原始状态／来源标记（保持原值，不补造真实性）：\n\n```json\n" + json.dumps(markers, ensure_ascii=False, indent=2) + "\n```\n\n"
+    return note + "---\n\n"
 
-    gaps = report.get("gaps", [])
-    if gaps:
-        md += "## Research Gaps\n\n"
-        for i, g in enumerate(gaps, 1):
-            md += f"{i}. {g}\n"
-        md += "\n"
 
-    consensus = report.get("consensus", [])
+def _build_research_report_md(report: dict, store: Optional[KnowledgeStore] = None) -> str:
+    """把 cross_validation_report 转为 Markdown 调研报告。
+
+    报告结构（完整版，满足辅助科研的「完整性 + 用词准确」）：
+    1. 研究缺口（类型 / 陈述 / 优先级 / 可操作性 / 建议行动）
+    2. 共识
+    3. 文献冲突（陈述 / 来源立场 / 处置 / 置信度）
+    4. 文献引用链（引用文献清单 + 结论引用溯源）
+    5. 证据链（检索溯源轨迹：子问题 → 数据源 → 命中 → 入库）
+
+    store 提供结构化实体（Material / ResearchGap / ResearchConflict 等）；
+    report dict 作为兜底。二者皆可为空，函数始终返回一个结构完整的报告骨架。
+    """
+    lines: list[str] = ["# 文献调研报告", ""]
+
+    # 主题与总体置信度
+    topic = ""
+    if store is not None:
+        try:
+            topic = store.get_kv("research_topic") or ""
+        except Exception:
+            topic = ""
+    topic = topic or report.get("topic", "") or report.get("title", "")
+    if topic:
+        lines.append(f"> **研究主题**：{topic}")
+
+    overall = report.get("overall_confidence")
+    try:
+        overall_str = f"{float(overall):.2f}" if overall is not None else "—"
+    except (TypeError, ValueError):
+        overall_str = str(overall)
+    lines.append(f"> **综合置信度**：{overall_str}")
+    lines.append(f"> **生成时间**：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append("")
+
+    # ===== 0. 领域脉络（写作方法论 M2：已有研究版图 3-5 句）=====
+    landscape = str(report.get("landscape") or "").strip() if isinstance(report, dict) else ""
+    if landscape:
+        lines.append("## 领域脉络")
+        lines.append("")
+        for seg in landscape.split("\n"):
+            seg = seg.strip()
+            if seg:
+                lines.append(seg)
+        lines.append("")
+
+    # ===== 统一拉取数据（供各章节复用）=====
+    papers: list = []
+    gaps_entities: list = []
+    conflicts_entities: list = []
+    evidence_entries: list = []
+    evidence_summary: dict = {}
+    if store is not None:
+        try:
+            papers = store.list_papers() or []
+        except Exception:
+            papers = []
+        try:
+            gaps_entities = store.list_research_gaps() or []
+        except Exception:
+            gaps_entities = []
+        try:
+            conflicts_entities = store.list_research_conflicts() or []
+        except Exception:
+            conflicts_entities = []
+        try:
+            evidence_entries = store.list_evidence(limit=500) or []
+        except Exception:
+            evidence_entries = []
+        try:
+            evidence_summary = store.evidence_stats() or {}
+        except Exception:
+            evidence_summary = {}
+    paper_by_id: dict[str, Any] = {p.paper_id: p for p in papers}
+
+    # ===== 1. 研究缺口 =====
+    report_gaps = report.get("gaps", []) if isinstance(report, dict) else []
+    if gaps_entities or report_gaps:
+        lines.append("## 1. 研究缺口（Research Gaps）")
+        lines.append("")
+        if gaps_entities:
+            for i, g in enumerate(gaps_entities, 1):
+                actions = "；".join(g.suggested_actions) if g.suggested_actions else "—"
+                mats = ", ".join(g.related_materials) if g.related_materials else "—"
+                tag = (
+                    f"{_cn(_GAP_TYPE_CN, g.gap_type)} · 优先级 {g.priority} · "
+                    f"可操作 {_cn(_GAP_ACTIONABILITY_CN, g.actionability)}"
+                )
+                lines.append(f"{i}. **[{tag}]** {g.statement or '—'}")
+                lines.append(f"   - 关联材料：{mats}")
+                lines.append(f"   - 建议行动：{actions}")
+                if g.detail:
+                    lines.append(f"   - 说明：{g.detail}")
+            lines.append("")
+        else:
+            for i, g in enumerate(report_gaps, 1):
+                if isinstance(g, dict):
+                    lines.append(f"{i}. {g.get('statement') or g.get('gap') or g}")
+                else:
+                    lines.append(f"{i}. {g}")
+            lines.append("")
+
+    # ===== 2. 共识 =====
+    consensus = report.get("consensus", []) if isinstance(report, dict) else []
     if consensus:
-        md += "## 共识\n\n"
+        lines.append("## 2. 共识")
+        lines.append("")
         for i, c in enumerate(consensus, 1):
-            md += f"{i}. {c}\n"
-        md += "\n"
+            lines.append(f"{i}. {c}")
+        lines.append("")
 
-    conflicts = report.get("conflicts", [])
-    if conflicts:
-        md += "## 冲突结论\n\n"
-        for c in conflicts:
-            if isinstance(c, dict):
-                md += f"- **{c.get('topic', '?')}**: {c.get('description', '')}\n"
-                if c.get("positions"):
-                    for pos in c["positions"]:
-                        md += f"  - {pos}\n"
-            else:
-                md += f"- {c}\n"
-        md += "\n"
+    # ===== 3. 文献冲突 =====
+    report_conflicts = report.get("conflicts", []) if isinstance(report, dict) else []
+    if conflicts_entities or report_conflicts:
+        lines.append("## 3. 文献冲突")
+        lines.append("")
+        if conflicts_entities:
+            for i, c in enumerate(conflicts_entities, 1):
+                lines.append(f"### 冲突 {i}：{c.claim or '(未命名冲突)'}")
+                lines.append("")
+                try:
+                    lines.append(f"- **置信度**：{float(c.confidence):.2f}")
+                except (TypeError, ValueError):
+                    lines.append(f"- **置信度**：{c.confidence}")
+                for src in c.sources or []:
+                    stance = src.get("stance", "?") if isinstance(src, dict) else "?"
+                    pid = src.get("paper_id", src.get("title", "?")) if isinstance(src, dict) else str(src)
+                    lines.append(f"- **来源立场**：`{_cn(_STANCE_CN, stance)}` — {pid}")
+                if c.subquery:
+                    lines.append(f"- **关联子问题**：{c.subquery}")
+                if c.resolution:
+                    lines.append(f"- **处置建议**：{c.resolution}")
+                lines.append("")
+        else:
+            for i, c in enumerate(report_conflicts, 1):
+                if isinstance(c, dict):
+                    claim = c.get("claim") or c.get("topic") or c.get("description") or "(未命名冲突)"
+                    lines.append(f"{i}. **{claim}**")
+                    conf_val = c.get("confidence")
+                    if conf_val is not None:
+                        try:
+                            lines.append(f"   - 置信度: {float(conf_val):.2f}")
+                        except (TypeError, ValueError):
+                            pass
+                    for src in c.get("sources") or c.get("positions") or []:
+                        lines.append(f"   - 观点/来源: {src}")
+                    for pid in c.get("source_paper_ids") or []:
+                        lines.append(f"   - 关联论文: {pid}")
+                    if c.get("subquery"):
+                        lines.append(f"   - 关联子问题: {c['subquery']}")
+                    if c.get("resolution"):
+                        lines.append(f"   - 处置: {c['resolution']}")
+                else:
+                    lines.append(f"{i}. {c}")
+            lines.append("")
 
-    return md
+    # ===== 4. 文献引用链（Reference Chain）=====
+    if papers:
+        lines.append("## 4. 文献引用链（Reference Chain）")
+        lines.append("")
+        lines.append(
+            "> 调研涉及的全部文献及其可溯源元数据，并汇总研究结论（缺口 / 冲突）"
+            "对文献的引用，实现「结论 → 文献」双向溯源。"
+        )
+        lines.append("")
+        lines.append("### 4.1 引用文献清单")
+        lines.append("")
+        lines.append("| # | 标题 | 作者（年份） | 期刊 · arXiv/DOI |")
+        lines.append("|---|---|---|---|")
+        for i, p in enumerate(papers, 1):
+            authors = ", ".join(p.authors[:2]) if p.authors else "—"
+            if len(p.authors) > 2:
+                authors += " 等"
+            year = p.year if p.year is not None else "—"
+            ext_id = p.arxiv_id or p.doi or "—"
+            title = re.sub(r"<[^>]+>", "", p.title or "").replace("\n", " ").strip() or "—"
+            title = title[:60] + ("…" if len(title) > 60 else "")
+            title = title.replace("|", "\\|")
+            venue = re.sub(r"<[^>]+>", "", p.venue or "").replace("\n", " ").strip() or "—"
+            venue = venue[:30] + ("…" if len(venue) > 30 else "")
+            venue = venue.replace("|", "\\|")
+            lines.append(
+                f"| {i} | {title} | {authors}（{year}） | {venue} · {ext_id} |"
+            )
+        lines.append("")
+
+        # 4.2 结论 → 文献引用溯源（缺口 / 冲突）
+        cite_by_paper: dict[str, set[str]] = {}
+
+        def _inc_cite(pid: Any, kind: str) -> None:
+            if not pid:
+                return
+            cite_by_paper.setdefault(str(pid), set()).add(kind)
+
+        for g in gaps_entities:
+            for ev in (g.evidence or []):
+                _inc_cite(ev.get("paper_id") if isinstance(ev, dict) else None, "研究缺口")
+        for c in conflicts_entities:
+            for src in (c.sources or []):
+                _inc_cite(src.get("paper_id") if isinstance(src, dict) else None, "文献冲突")
+
+        if cite_by_paper:
+            lines.append("### 4.2 结论引用溯源")
+            lines.append("")
+            lines.append("| 标题 | 支撑的结论类型 |")
+            lines.append("|---|---|")
+            for pid, kinds in sorted(cite_by_paper.items()):
+                detail = "、".join(sorted(kinds))
+                pp = paper_by_id.get(pid)
+                title = re.sub(r"<[^>]+>", "", (pp.title if pp is not None and pp.title else "")).replace("|", "\\|").strip() or "—"
+                lines.append(f"| {title} | {detail} |")
+            lines.append("")
+
+    # ===== 5. 证据链（Evidence Chain / 检索溯源轨迹）=====
+    if evidence_entries:
+        lines.append("## 5. 证据链（检索溯源轨迹）")
+        lines.append("")
+        total_ev = evidence_summary.get("total") or len(evidence_entries)
+        linked_ev = evidence_summary.get("linked", 0)
+        by_source = evidence_summary.get("by_source") or {}
+        src_str = "、".join(f"{k}×{v}" for k, v in by_source.items()) if by_source else "—"
+        lines.append(f"- **证据条目总数**：{total_ev}（其中已关联入库：{linked_ev}）")
+        lines.append(f"- **数据源分布**：{src_str}")
+        lines.append("")
+        lines.append("| # | 子问题 | 数据源 | 命中文献 | 证据分 | 入库 |")
+        lines.append("|---|---|---|---|---|---|")
+        shown = 0
+        for e in evidence_entries:
+            if shown >= 200:
+                lines.append(
+                    f"| … | 其余 {len(evidence_entries) - shown} 条从略（详见「证据链」面板） | | | | |"
+                )
+                break
+            linked = "✓" if e.get("paper_id") else "—"
+            title = (e.get("title") or "—")[:50].replace("|", "\\|").replace("\n", " ")
+            score = e.get("evidence_score") or 0.0
+            try:
+                score_str = f"{float(score):.2f}"
+            except (TypeError, ValueError):
+                score_str = str(score)
+            subq = (e.get("subquery") or "—")[:30].replace("|", "\\|").replace("\n", " ")
+            lines.append(
+                f"| {shown + 1} | {subq} | {e.get('source') or '—'} | {title} | "
+                f"{score_str} | {linked} |"
+            )
+            shown += 1
+        lines.append("")
+
+    # 空报告兜底
+    if len(lines) <= 4:  # 仅标题 + 概览
+        lines.append("> 暂无调研产出。请先运行 research 阶段（启动 Pipeline）。")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def _make_download(content: str, filename: str, media_type: str, fmt: str = "md") -> Response:
@@ -2712,61 +3176,146 @@ def _make_download(content: str, filename: str, media_type: str, fmt: str = "md"
     )
 
 
+# ===== 状态 / 术语中文映射（统一报告用词）=====
+
+_CLAIM_STATUS_CN = {
+    "draft": "草稿",
+    "evidence_linked": "已关联证据",
+    "verified": "已验证",
+    "refuted": "已被反驳",
+    "superseded": "已被取代",
+}
+_CLAIM_ROLE_CN = {
+    "contribution": "核心贡献",
+    "method": "方法",
+    "assumption": "假设",
+    "result": "结果",
+}
+_IDEA_STATUS_CN = {
+    "draft": "草稿",
+    "validated": "已验证",
+    "rejected": "已否决",
+    "adopted": "已采纳",
+}
+_EXPERIMENT_STATUS_CN = {
+    "planned": "已规划",
+    "running": "运行中",
+    "completed": "已完成",
+    "failed": "失败",
+    "anomaly_detected": "检测到异常",
+}
+_GAP_TYPE_CN = {
+    "contradiction": "矛盾结论",
+    "unexplored": "未探索方向",
+    "underexplored": "探索不足方向",
+    "missing_link": "缺失知识连接",
+    "missing_connection": "缺失知识连接",
+    "data_gap": "数据缺口",
+    "method_gap": "方法缺口",
+}
+_GAP_ACTIONABILITY_CN = {
+    "high": "高",
+    "medium": "中",
+    "low": "低",
+}
+_STANCE_CN = {
+    "support": "支持",
+    "refute": "反驳",
+}
+
+
+def _cn(mapping: dict, key: Any) -> str:
+    """英文枚举值 → 中文术语，未知或空则返回原值/占位。"""
+    if key is None:
+        return "—"
+    s = str(key)
+    return mapping.get(s, s)
+
+
 def _build_claims_summary_md(store: KnowledgeStore) -> str:
-    """构建 Claim 汇总 Markdown。"""
+    """构建 Claim 汇总 Markdown（中文术语 + 状态/角色映射）。"""
     claims = store.list_claims()
     md = "# Claim 汇总\n\n"
+    md += f"共 **{len(claims)}** 条 Claim\n\n---\n\n"
+    if not claims:
+        md += "> 暂无 Claim，请先运行 design 阶段。\n\n"
+        return md
     for c in claims:
         md += f"## {c.claim_id}\n\n"
-        md += f"**陈述**: {c.statement}\n\n"
-        md += f"**状态**: {c.status.value}\n\n"
-        md += f"**角色**: {c.role}\n\n"
+        md += f"**陈述**：{c.statement}\n\n"
+        md += f"**状态**：{_cn(_CLAIM_STATUS_CN, c.status.value if hasattr(c.status, 'value') else c.status)}\n\n"
+        md += f"**角色**：{_cn(_CLAIM_ROLE_CN, c.role)}\n\n"
+        if getattr(c, "created_at", None):
+            md += f"**创建时间**：{c.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
+        if getattr(c, "verified_at", None):
+            md += f"**验证时间**：{c.verified_at.strftime('%Y-%m-%d %H:%M')}\n\n"
         if c.evidence_refs:
-            md += "**证据**:\n"
+            md += "**证据链**：\n"
             for ref in c.evidence_refs:
-                md += f"- {ref.get('type', '?')}: {ref.get('id', '?')}"
+                ev_type = _cn({"paper": "文献", "experiment": "实验"}, ref.get("type", "?"))
+                md += f"- {ev_type}：{ref.get('id', '?')}"
                 if ref.get("chunk_id"):
-                    md += f" (chunk: {ref['chunk_id']})"
+                    md += f"（chunk: {ref['chunk_id']}）"
                 md += "\n"
-        md += "\n"
+        md += "\n---\n\n"
     return md
 
 
 def _build_ideas_summary_md(store: KnowledgeStore) -> str:
-    """构建研究思路汇总 Markdown。"""
+    """构建研究思路汇总 Markdown（中文术语 + 结构化验证记录）。"""
     ideas = store.list_ideas()
     md = "# 研究思路汇总\n\n"
-    md += f"共 {len(ideas)} 个思路\n\n---\n\n"
+    md += f"共 **{len(ideas)}** 个思路\n\n---\n\n"
+    if not ideas:
+        md += "> 暂无研究思路，请先运行 ideation 阶段。\n\n"
+        return md
     for idea in ideas:
         md += f"## {idea.idea_id}\n\n"
-        md += f"**状态**: {idea.status}\n\n"
-        md += f"**思路**: {idea.text}\n\n"
+        md += f"**状态**：{_cn(_IDEA_STATUS_CN, idea.status)}\n\n"
+        md += f"**思路**：{idea.text}\n\n"
         if idea.constraints:
-            md += f"**约束**: {'; '.join(idea.constraints)}\n\n"
+            md += f"**约束条件**：{'；'.join(idea.constraints)}\n\n"
         if idea.source_paper_ids:
-            md += f"**来源论文**: {', '.join(idea.source_paper_ids)}\n\n"
+            md += f"**来源论文**：{', '.join(idea.source_paper_ids)}\n\n"
+        if getattr(idea, "created_by", None):
+            md += f"**提出者**：{idea.created_by}\n\n"
         if idea.validation_notes:
-            md += f"**验证**: {json.dumps(idea.validation_notes, ensure_ascii=False)}\n\n"
+            md += "**验证记录**：\n"
+            if isinstance(idea.validation_notes, dict):
+                for k, v in idea.validation_notes.items():
+                    md += f"- **{k}**：{v}\n"
+            else:
+                md += f"- {idea.validation_notes}\n"
+            md += "\n"
         md += "---\n\n"
     return md
 
 
 def _build_experiment_results_md(store: KnowledgeStore, project_id: str) -> str:
-    """构建实验结果 Markdown（含 metrics）。"""
+    """构建实验结果 Markdown（含 metrics，中文术语）。"""
     experiments = store.list_experiments()
     md = "# 实验结果汇总\n\n"
-    md += f"共 {len(experiments)} 个实验\n\n---\n\n"
+    md += f"共 **{len(experiments)}** 个实验\n\n---\n\n"
+    if not experiments:
+        md += "> 暂无实验记录，请先运行 experiment 阶段。\n\n"
+        return md
     for exp in experiments:
         md += f"## {exp.name or exp.experiment_id}\n\n"
-        md += f"**状态**: {exp.status.value if hasattr(exp.status, 'value') else exp.status}\n\n"
+        md += f"**状态**：{_cn(_EXPERIMENT_STATUS_CN, exp.status.value if hasattr(exp.status, 'value') else exp.status)}\n\n"
         if hasattr(exp, 'metrics') and exp.metrics:
-            md += f"**Metrics**: {json.dumps(exp.metrics, ensure_ascii=False, indent=2)}\n\n"
+            md += "**评估指标**：\n"
+            if isinstance(exp.metrics, dict):
+                for k, v in exp.metrics.items():
+                    md += f"- **{k}**：{v}\n"
+            else:
+                md += f"```\n{json.dumps(exp.metrics, ensure_ascii=False, indent=2)}\n```\n"
+            md += "\n"
         if exp.result_summary:
-            md += f"**结果摘要**:\n```\n{exp.result_summary[:3000]}\n```\n\n"
-        if exp.anomaly_notes:
-            md += f"**异常**: {exp.anomaly_notes[:1000]}\n\n"
+            md += f"**结果摘要**：\n```\n{exp.result_summary[:3000]}\n```\n\n"
+        if getattr(exp, 'anomaly_notes', None):
+            md += f"**异常说明**：{exp.anomaly_notes[:1000]}\n\n"
         if exp.verifies_claim_ids:
-            md += f"**验证 Claim**: {', '.join(exp.verifies_claim_ids)}\n\n"
+            md += f"**验证的 Claim**：{', '.join(exp.verifies_claim_ids)}\n\n"
         md += "---\n\n"
     return md
 
@@ -2777,13 +3326,13 @@ def _build_full_report_md(store: KnowledgeStore, project_id: str) -> str:
 
     # 标题
     topic = store.get_kv("research_topic") or "(未设置主题)"
-    parts.append(f"# 科研项目全流程报告\n\n**研究主题**: {topic}\n\n**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n---\n\n")
+    parts.append(f"# 科研项目全流程报告\n\n**研究主题**：{topic}\n\n**生成时间**：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n---\n\n")
 
     # 1. 调研报告
     report = store.get_kv("cross_validation_report") or {}
     if report:
         parts.append("---\n\n# 第一部分：文献调研\n\n")
-        parts.append(_build_research_report_md(report))
+        parts.append(_build_research_report_md(report, store))
 
     # 2. 研究思路
     ideas = store.list_ideas()
@@ -2801,10 +3350,10 @@ def _build_full_report_md(store: KnowledgeStore, project_id: str) -> str:
     try:
         from core.artifacts import ArtifactManager
         from core.knowledge import ArtifactType
-        am = ArtifactManager(_CONFIG.paths.project_db(project_id))
+        am = _artifact_manager(project_id,read_only=True)
         arts = am.list_artifacts(artifact_type=ArtifactType.METHOD_DOC)
         if arts:
-            content = am.read_content(arts[0]) or str(arts[0].content or "")
+            content = am.read_content(arts[-1]) or str(arts[-1].content or "")
             parts.append("\n\n---\n\n# 第四部分：方法设计\n\n")
             parts.append(content)
     except Exception:
@@ -2820,14 +3369,36 @@ def _build_full_report_md(store: KnowledgeStore, project_id: str) -> str:
     try:
         from core.artifacts import ArtifactManager
         from core.knowledge import ArtifactType
-        am = ArtifactManager(_CONFIG.paths.project_db(project_id))
+        am = _artifact_manager(project_id,read_only=True)
         arts = am.list_artifacts(artifact_type=ArtifactType.PAPER_DRAFT)
         if arts:
-            content = am.read_content(arts[0]) or str(arts[0].content or "")
+            content = am.read_content(arts[-1]) or str(arts[-1].content or "")
             parts.append("\n\n---\n\n# 第六部分：论文稿\n\n")
             parts.append(content)
     except Exception:
         pass
+
+    # 7. 关系发现（可选子流程：MCTS + LLM 引导搜索）
+    discovery_content = strip_think_tags(store.get_kv("discovery_report_content") or "")
+    if not discovery_content:
+        summary = store.get_kv("discovery_summary") or {}
+        if summary:
+            discovery_content = (
+                "# 关系发现\n\n"
+                f"- 候选假设数：{summary.get('hypotheses', 0)}\n"
+                f"- 验证发现数：{summary.get('relationships', 0)}\n"
+                f"- 其中新颖发现：{summary.get('novel', 0)}\n"
+            )
+    if discovery_content:
+        parts.append("\n\n---\n\n# 第七部分：关系发现\n\n")
+        parts.append(discovery_content)
+
+    from core.workspace.service import WorkspaceService
+    workspace = WorkspaceService(project_id,_CONFIG.paths.project_db(project_id),initialize_store=False)
+    if workspace.load().items:
+        parts.append("\n\n---\n\n# 第八部分：当前研究主线与用户记录\n\n")
+        parts.append("以下含计划、骨架及可能的演示假设；以各记录标记为准，不将预期数据算作真实实验结果。\n\n")
+        parts.append(workspace.export_markdown())
 
     return "".join(parts) if parts else "# 全流程报告\n\n（暂无产出）"
 
@@ -2835,10 +3406,47 @@ def _build_full_report_md(store: KnowledgeStore, project_id: str) -> str:
 # ===== 格式转换：Markdown → DOCX / PDF =====
 
 
+# ===== Markdown 解析辅助（表格 + 行内标记）=====
+
+
+def _md_strip_inline(text: str) -> str:
+    """去除行内 Markdown 标记（加粗/斜体/行内代码），供 DOCX/PDF 纯文本渲染。"""
+    # 行内代码 `x`
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    # 加粗 **x** / __x__
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    # 斜体 *x*（避免误伤 ** 已处理后的残留）
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
+    return text.strip()
+
+
+def _md_is_table_separator(line: str) -> bool:
+    """判断是否为 Markdown 表格分隔行（如 |---|:--:|---|）。"""
+    stripped = line.strip().replace(" ", "")
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return False
+    inner = stripped[1:-1]
+    if not inner:
+        return False
+    cells = inner.split("|")
+    return all(c and set(c) <= {"-", ":"} for c in cells)
+
+
+def _md_split_table_row(line: str) -> list[str]:
+    """Split Markdown columns without breaking TeX cardinality/norm expressions."""
+    return [_md_strip_inline(cell) for cell in split_table_row(line)]
+
+@heavy_operation
 def _md_to_docx_response(md_content: str, base_filename: str) -> Response:
-    """将 Markdown 转为 DOCX 并返回下载响应。"""
+    """将 Markdown 转为 DOCX 并返回下载响应。
+
+    支持：标题（#/##/###）、引用（>）、列表（-/*/数字）、代码块（```）、
+    分隔线（---）、以及 Markdown 表格（| a | b |，含 |---| 分隔行）。
+    """
     import io
     from docx import Document
+    from docx.enum.table import WD_TABLE_ALIGNMENT
     from docx.shared import Pt
 
     doc = Document()
@@ -2846,13 +3454,17 @@ def _md_to_docx_response(md_content: str, base_filename: str) -> Response:
     style = doc.styles["Normal"]
     style.font.size = Pt(11)
 
+    lines = md_content.split("\n")
     in_code_block = False
-    for line in md_content.split("\n"):
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         stripped = line.strip()
 
         # 代码块
         if stripped.startswith("```"):
             in_code_block = not in_code_block
+            i += 1
             continue
         if in_code_block:
             p = doc.add_paragraph(line)
@@ -2860,25 +3472,56 @@ def _md_to_docx_response(md_content: str, base_filename: str) -> Response:
             run = p.runs[0] if p.runs else p.add_run("")
             run.font.name = "Consolas"
             run.font.size = Pt(9)
+            i += 1
+            continue
+
+        # Markdown 表格：| ... | 且下一行为 |---| 分隔行
+        if stripped.startswith("|") and i + 1 < len(lines) and _md_is_table_separator(lines[i + 1]):
+            header = _md_split_table_row(stripped)
+            i += 2  # 跳过分隔行
+            rows: list[list[str]] = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append(_md_split_table_row(lines[i]))
+                i += 1
+            ncols = len(header)
+            table = doc.add_table(rows=1, cols=ncols)
+            table.style = "Table Grid"
+            table.alignment = WD_TABLE_ALIGNMENT.CENTER
+            # 表头加粗
+            hdr_cells = table.rows[0].cells
+            for j in range(ncols):
+                hdr_cells[j].text = header[j] if j < len(header) else ""
+                for para in hdr_cells[j].paragraphs:
+                    for run in para.runs:
+                        run.bold = True
+            # 数据行
+            for row in rows:
+                cells = table.add_row().cells
+                for j in range(ncols):
+                    cells[j].text = row[j] if j < len(row) else ""
+            doc.add_paragraph("")  # 表格后空行，避免与后续段落粘连
             continue
 
         # 标题
         if stripped.startswith("### "):
-            doc.add_heading(stripped[4:], level=3)
+            doc.add_heading(_md_strip_inline(stripped[4:]), level=3)
         elif stripped.startswith("## "):
-            doc.add_heading(stripped[3:], level=2)
+            doc.add_heading(_md_strip_inline(stripped[3:]), level=2)
         elif stripped.startswith("# "):
-            doc.add_heading(stripped[2:], level=1)
+            doc.add_heading(_md_strip_inline(stripped[2:]), level=1)
         elif stripped.startswith("---"):
             doc.add_paragraph("─" * 40)
+        elif stripped.startswith("> "):
+            doc.add_paragraph(_md_strip_inline(stripped[2:]))
         elif stripped.startswith("- ") or stripped.startswith("* "):
-            doc.add_paragraph(stripped[2:], style="List Bullet")
+            doc.add_paragraph(_md_strip_inline(stripped[2:]), style="List Bullet")
         elif stripped and stripped[0].isdigit() and ". " in stripped[:5]:
             idx = stripped.index(". ")
-            doc.add_paragraph(stripped[idx + 2:], style="List Number")
+            doc.add_paragraph(_md_strip_inline(stripped[idx + 2:]), style="List Number")
         elif stripped:
-            doc.add_paragraph(stripped)
+            doc.add_paragraph(_md_strip_inline(stripped))
         # 空行跳过
+        i += 1
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -2889,12 +3532,36 @@ def _md_to_docx_response(md_content: str, base_filename: str) -> Response:
     )
 
 
+# 中文字体（SimHei/微软雅黑）缺失的符号字形 → 安全 ASCII/中文表示。
+# 避免 PDF 里出现「方块/乱码」。注意：这些映射仅用于 PDF 纯文本渲染，
+# 不影响 Markdown / DOCX 原文。
+_PDF_GLYPH_MAP = {
+    "\u2713": "[通过]",   # ✓ CHECK MARK
+    "\u2714": "[通过]",   # ✔ HEAVY CHECK MARK
+    "\u2717": "[未通过]",  # ✗ BALLOT X
+    "\u2718": "[未通过]",  # ✘ HEAVY BALLOT X
+    "\u26a0": "[!]",      # ⚠ WARNING SIGN
+    "\u2605": "[*]",      # ★ BLACK STAR
+    "\u2606": "[*]",      # ☆ WHITE STAR
+    "\u2192": "->",       # → RIGHTWARDS ARROW
+    "\u21d2": "=>",       # ⇒ RIGHTWARDS DOUBLE ARROW
+    "\u2b06": "[上]",      # ⬆ UP ARROW
+    "\u2b07": "[下]",      # ⬇ DOWN ARROW
+    "\u2026": "...",      # … HORIZONTAL ELLIPSIS
+    "\ufe0f": "",         # emoji 变体选择符（⚠️ → ⚠）
+}
+
+
 def _pdf_safe_text(text: str, max_chars: int = 100) -> str:
-    """pdf 文本安全化：去除不可打印控制符，超长行按字符截断；
-    连续无空格长串（URL / 代码）按 40 字符插空格，防止 fpdf2 抛
-    'Not enough horizontal space to render a single character'。"""
+    """pdf 文本安全化：去除不可打印控制符，替换中文字体缺失的符号字形，
+    超长行按字符截断；连续无空格长串（URL / 代码）按 40 字符插空格，
+    防止 fpdf2 抛 'Not enough horizontal space to render a single character'。"""
     if text is None:
         return ""
+    # 替换缺失字形（先做，避免 emoji 变体选择符干扰）
+    for src, dst in _PDF_GLYPH_MAP.items():
+        if src in text:
+            text = text.replace(src, dst)
     # 保留常见标点与中文，剥离控制字符（\x00-\x1f 等）
     safe = "".join(ch for ch in text if ch >= " " or ch in "\n\r\t")
     # 给超过 40 字符的无空格连续串插入空格，便于 word wrap
@@ -2912,14 +3579,17 @@ def _pdf_safe_text(text: str, max_chars: int = 100) -> str:
         out.append(ch)
     safe = "".join(out)
     if len(safe) > max_chars:
-        safe = safe[:max_chars] + "…"
+        safe = safe[:max_chars] + "..."
     return safe
 
 
+@heavy_operation
 def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
     """将 Markdown 转为 PDF 并返回下载响应。
 
     使用 fpdf2 + Windows 系统中文字体（Microsoft YaHei / SimHei）。
+    支持：标题（#/##/###）、引用（>）、列表（-/*）、代码块（```）、
+    分隔线（---）、以及 Markdown 表格（| a | b |，含 |---| 分隔行）。
     """
     import io
     from fpdf import FPDF
@@ -2944,6 +3614,8 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
         if os.path.exists(fp):
             try:
                 pdf.add_font(font_name, "", fp)
+                # 注册粗体（fpdf2 table 表头默认加粗，需 B 样式字体）
+                pdf.add_font(font_name, "B", fp)
                 font_loaded = True
                 break
             except Exception:
@@ -2954,12 +3626,16 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
 
     pdf.set_font(font_name, size=11)
 
+    lines = md_content.split("\n")
     in_code_block = False
-    for line in md_content.split("\n"):
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         stripped = line.strip()
 
         if stripped.startswith("```"):
             in_code_block = not in_code_block
+            i += 1
             continue
         if in_code_block:
             pdf.set_font(font_name, size=8)
@@ -2967,33 +3643,51 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
             # 防止 fpdf2 遇到超宽单词抛 "Not enough horizontal space"
             pdf.multi_cell(0, 5, _pdf_safe_text(stripped, 80), wrapmode="CHAR", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
+            i += 1
+            continue
+
+        # Markdown 表格：| ... | 且下一行为 |---| 分隔行
+        if stripped.startswith("|") and i + 1 < len(lines) and _md_is_table_separator(lines[i + 1]):
+            header = _md_split_table_row(stripped)
+            i += 2  # 跳过分隔行
+            rows: list[list[str]] = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append(_md_split_table_row(lines[i]))
+                i += 1
+            _draw_pdf_table(pdf, font_name, header, rows)
+            pdf.ln(2)
             continue
 
         if stripped.startswith("### "):
             pdf.set_font(font_name, size=13)
             pdf.ln(3)
-            pdf.multi_cell(0, 7, _pdf_safe_text(stripped[4:]), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(0, 7, _pdf_safe_text(_md_strip_inline(stripped[4:])), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
         elif stripped.startswith("## "):
             pdf.set_font(font_name, size=15)
             pdf.ln(5)
-            pdf.multi_cell(0, 8, _pdf_safe_text(stripped[3:]), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(0, 8, _pdf_safe_text(_md_strip_inline(stripped[3:])), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
         elif stripped.startswith("# "):
             pdf.set_font(font_name, size=18)
             pdf.ln(8)
-            pdf.multi_cell(0, 10, _pdf_safe_text(stripped[2:]), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(0, 10, _pdf_safe_text(_md_strip_inline(stripped[2:])), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(font_name, size=11)
         elif stripped.startswith("---"):
             pdf.ln(3)
             pdf.multi_cell(0, 5, "=" * 60, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.ln(2)
+        elif stripped.startswith("> "):
+            pdf.set_font(font_name, size=10)
+            pdf.multi_cell(0, 6, _pdf_safe_text(_md_strip_inline(stripped[2:])), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font(font_name, size=11)
         elif stripped.startswith("- ") or stripped.startswith("* "):
-            pdf.multi_cell(0, 6, f"  \u2013 {_pdf_safe_text(stripped[2:])}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(0, 6, f"  \u2013 {_pdf_safe_text(_md_strip_inline(stripped[2:]))}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         elif stripped:
-            pdf.multi_cell(0, 6, _pdf_safe_text(stripped), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(0, 6, _pdf_safe_text(_md_strip_inline(stripped)), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         else:
             pdf.ln(3)
+        i += 1
 
     buf = io.BytesIO()
     pdf.output(buf)
@@ -3004,41 +3698,138 @@ def _md_to_pdf_response(md_content: str, base_filename: str) -> Response:
     )
 
 
+def _draw_pdf_table(pdf: Any, font_name: str, header: list[str], rows: list[list[str]]) -> None:
+    """用 fpdf2 table API 绘制 Markdown 表格。
+
+    列宽按页面有效宽度均分；单元格文本过 _pdf_safe_text 防超宽字符抛异常；
+    表头自动加粗（fpdf2 默认 heading 行为）。
+    """
+    from fpdf import FPDF  # noqa: F401
+
+    ncols = max(len(header), 1)
+    # 有效页面宽度均分到各列
+    usable = pdf.epw  # effective page width (mm)
+    col_widths = tuple(usable / ncols for _ in range(ncols))
+
+    pdf.set_font(font_name, size=9)
+    with pdf.table(col_widths=col_widths, text_align="LEFT") as table:
+        # 表头行
+        head_row = table.row()
+        for j in range(ncols):
+            head_row.cell(_pdf_safe_text(header[j] if j < len(header) else "", 200))
+        # 数据行
+        for row in rows:
+            data_row = table.row()
+            for j in range(ncols):
+                cell_text = row[j] if j < len(row) else ""
+                data_row.cell(_pdf_safe_text(cell_text, 400))
+    pdf.set_font(font_name, size=11)
+
+
 # ===== 文件上传 =====
 
 
-@app.post("/api/projects/{project_id}/upload-paper")
-async def upload_paper(
-    project_id: str,
-    file: UploadFile = File(...),
-    title: Optional[str] = Form(None),
-):
+@app.post("/api/projects/{project_id}/upload-paper", openapi_extra={"requestBody": {
+    "required": True, "content": {"multipart/form-data": {"schema": {
+        "type": "object", "required": ["file"], "properties": {
+            "file": {"type": "string", "format": "binary"},
+            "title": {"type": "string"}, "request_id": {"type": "string", "maxLength": 128}
+        }}}}}})
+async def upload_paper(project_id: str, request: Request):
+    from core.workspace.uploads import UploadService, UploadError
+    from starlette.concurrency import run_in_threadpool
+    from web.bounded_uploads import receive_upload, read_bounded
+    _require_project(project_id)
+    async with receive_upload(request) as (form, file):
+        raw = await read_bounded(file)
+        title = form.get("title")
+        rid = form.get("request_id") or uuid.uuid4().hex
+        filename = file.filename or "uploaded.txt"
+        try:
+            service = UploadService(_CONFIG.paths.project_db(project_id), project_id)
+            result = await run_in_threadpool(service.process, rid, filename, raw, title,
+                lambda capture, paper_id: _prepare_upload(project_id, raw, filename, title, capture, paper_id))
+            return JSONResponse(status_code=202 if result["status"] == "processing" else 200, content=result)
+        except UploadError as exc:
+            raise HTTPException(exc.code, detail=str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/upload-requests/{request_id}")
+def upload_request_state(project_id: str,request_id: str):
+    from core.workspace.uploads import UploadService,UploadError
+    _require_project(project_id)
+    try:
+        return UploadService(_CONFIG.paths.project_db(project_id),project_id).status(request_id)
+    except UploadError as exc:
+        raise HTTPException(exc.code,detail=str(exc)) from exc
+
+
+def _prepare_upload(project_id, raw, filename, title, store, paper_id):
+    try:
+        return _prepare_upload_content(project_id, raw, filename, title, store, paper_id)
+    except BaseException as exc:
+        if re.fullmatch(r"paper_[a-f0-9]{12}", paper_id) and Path(filename).name == filename:
+            project_root = _CONFIG.paths.project_dir(project_id).resolve()
+            root = (project_root / "uploads").resolve()
+            output = root / (paper_id + "_" + filename)
+            if root.is_relative_to(project_root):
+                for owned in (output.with_suffix(output.suffix + ".part"), output):
+                    if owned.resolve().parent == root and owned.is_file():
+                        owned.unlink()
+        if isinstance(exc, HTTPException):
+            from core.workspace.uploads import UploadError
+            raise UploadError(str(exc.detail), exc.status_code) from None
+        raise
+
+
+def _prepare_upload_content(project_id,raw,filename,title,store,paper_id):
     """上传 PDF/文本文献，入库为 Paper 实体。
 
-    支持 .pdf / .txt / .md 文件。PDF 仅存储元信息（不做 OCR），
-    txt/md 直接作为摘要与 chunk 素材。
+    支持 .pdf / .txt / .md 文件。PDF 按现有解析能力提取片段，
+    txt/md 保存正文片段，开头节选不是论文摘要或全文核验。
     """
     _require_project(project_id)
-    store = KnowledgeStore(_CONFIG.paths.project_db(project_id))
-
-    # 读取文件内容
-    raw = await file.read()
-    filename = file.filename or "uploaded.txt"
+    db = _CONFIG.paths.project_db(project_id)
+    if not db.is_file():
+        raise HTTPException(404, detail="项目数据库不存在，未创建空白数据替代历史项目")
+    if filename != Path(filename).name or any(c in filename for c in ("/", "\\", ":")):
+        raise HTTPException(400, detail="文件名不能包含目录或路径，请重命名后上传")
     ext = Path(filename).suffix.lower()
-
-    paper_id = f"paper_{uuid.uuid4().hex[:12]}"
+    if ext not in (".pdf", ".txt", ".md"):
+        raise HTTPException(400, detail=f"不支持的文件类型: {ext}")
+    if not raw:
+        raise HTTPException(400, detail="文件为空，请选择包含正文的文件")
+    text_content = ""
+    if ext in (".txt", ".md"):
+        try:
+            text_content = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(400, detail="文本不是有效 UTF-8，请转换编码后重试") from exc
+        if not text_content.strip():
+            raise HTTPException(400, detail="文件没有可读取的正文")
     abstract = ""
     pdf_path = None
     parse_mode = "none"
     sections_count = 0
     figures_count = 0
+    mineru_doc = None
+    parse_error = None
 
     if ext == ".pdf":
-        # PDF：保存到项目目录，调用 MinerU 解析结构化内容（赛题三·方向三推荐工具）
-        upload_dir = _CONFIG.paths.project_dir(project_id) / "uploads"
+        # PDF：保存到项目目录，调用 MinerU 解析结构化内容（推荐工具）
+        project_root = _CONFIG.paths.project_dir(project_id).resolve()
+        upload_dir = project_root / "uploads"
+        if not upload_dir.resolve().is_relative_to(project_root):
+            raise HTTPException(400, "上传目录不在当前项目内，未保存文件")
         upload_dir.mkdir(parents=True, exist_ok=True)
-        pdf_path = upload_dir / filename
-        pdf_path.write_bytes(raw)
+        # A new upload must not overwrite the file backing an older paper.
+        pdf_path = upload_dir / (paper_id + "_" + filename)
+        pending_path = pdf_path.with_suffix(pdf_path.suffix+".part")
+        with pending_path.open("wb") as pending_file:
+            pending_file.write(raw)
+            pending_file.flush()
+            os.fsync(pending_file.fileno())
+        os.replace(pending_path,pdf_path)
 
         # MinerU 解析（无 API key 时降级到 pypdf fallback）
         from core.tools import parse_pdf_with_mineru, mineru_is_available
@@ -3051,7 +3842,9 @@ async def upload_paper(
                 # 优先使用 MinerU 抽取的 title
                 extracted_title = mineru_doc.title if mineru_doc.title else None
                 # 拼接前 2000 字作为 abstract
-                abstract = mineru_doc.full_text[:2000] if mineru_doc.full_text else f"(MinerU {parse_mode} 解析: {filename})"
+                abstract = mineru_doc.full_text[:2000] if mineru_doc.full_text else ""
+                if not abstract.strip():
+                    parse_error = "PDF 已保存，但未提取到可读取正文，请补充文本或核对文件"
                 # 把 MinerU 解析的结构化数据存入 KV（前端可视化与 discovery 阶段使用）
                 store.save_kv(f"mineru_{paper_id}", {
                     "title": mineru_doc.title,
@@ -3068,18 +3861,20 @@ async def upload_paper(
                 })
                 if extracted_title and not title:
                     title = extracted_title
-            except Exception as e:
+            except Exception:
                 parse_mode = "error"
-                abstract = f"(MinerU 解析失败: {e}，需手动提取文本)"
+                abstract = ""
+                parse_error = "PDF 已保存，但解析失败；未读取正文，请补充文本后讨论"
         else:
             parse_mode = "fallback"
-            abstract = f"(PDF 文件已上传: {filename}，未启用 MinerU 解析，需手动提取文本)"
+            parse_error = "PDF 已保存，解析服务未启用；仅有元信息，请补充文本"
 
     elif ext in (".txt", ".md"):
         parse_mode = "text"
-        abstract = raw.decode("utf-8", errors="replace")[:5000]
-    else:
-        raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
+        abstract = text_content[:5000]
+
+    if ext == ".pdf" and (parse_error or not abstract.strip()):
+        raise HTTPException(422, "PDF 解析未完成，未入库；请核对文件或改用可读取的文本后手动重试")
 
     from core.knowledge import Paper
     # 清理文件名/标题中可能残留的前端 HTML 标签
@@ -3092,6 +3887,15 @@ async def upload_paper(
         url=None,
         pdf_path=str(pdf_path) if pdf_path else None,
         source_stage="upload",
+        metadata={
+            "parse_mode": parse_mode,
+            "parse_error": parse_error,
+            "reading_scope": (
+                "用户上传文本：已保存正文片段，展示为开头节选，不等于论文摘要或已核验全文"
+                if text_content else
+                "PDF 提取片段：未确认全文完整性" if abstract else "仅元信息；未读取正文"
+            ),
+        },
     )
     store.save_paper(paper)
 
@@ -3113,10 +3917,10 @@ async def upload_paper(
 
     # txt/md 内容切分为 chunk（PDF 由 MinerU 解析后也会按 section 切分）
     chunk_count = 0
-    if ext in (".txt", ".md") and abstract:
+    if ext in (".txt", ".md") and text_content:
         from core.tools import split_into_chunks
         from core.knowledge import PaperChunk
-        text_chunks = split_into_chunks(abstract, max_tokens=500, overlap_tokens=50)
+        text_chunks = split_into_chunks(text_content, max_tokens=500, overlap_tokens=50)
         paper_chunks = [
             PaperChunk(
                 chunk_id=f"{paper_id}_c{tc.index}",
@@ -3129,12 +3933,10 @@ async def upload_paper(
         if paper_chunks:
             store.save_paper_chunks(paper_chunks)
             chunk_count = len(paper_chunks)
-    elif ext == ".pdf" and parse_mode != "none" and parse_mode != "error":
+    elif mineru_doc is not None and abstract:
         # MinerU 解析后按 section 切分 chunk（结构化优于字符切分）
         try:
-            from core.tools import parse_pdf_with_mineru
             from core.knowledge import PaperChunk
-            mineru_doc = parse_pdf_with_mineru(pdf_path)
             paper_chunks = []
             for i, sec in enumerate(mineru_doc.sections):
                 if not sec.text or len(sec.text.strip()) < 20:
@@ -3161,45 +3963,299 @@ async def upload_paper(
         "parse_mode": parse_mode,
         "sections_count": sections_count,
         "figures_count": figures_count,
-        "message": "文献上传成功",
+        "reading_scope": paper.metadata["reading_scope"],
+        "parse_error": parse_error,
+        "message": parse_error or "文献上传成功，可基于已保存片段讨论",
     }
 
 
-@app.post("/api/projects/{project_id}/upload-topic")
-async def upload_topic(
-    project_id: str,
-    file: UploadFile = File(...),
-):
-    """上传主题描述文件（.txt/.md），覆盖项目主题。"""
+@app.post("/api/projects/{project_id}/upload-topic", openapi_extra={"requestBody": {
+    "required": True, "content": {"multipart/form-data": {"schema": {
+        "type": "object", "required": ["file"],
+        "properties": {"file": {"type": "string", "format": "binary"}}
+    }}}}})
+async def upload_topic(project_id: str, request: Request):
+    from web.bounded_uploads import receive_upload, read_bounded
     state = _require_project(project_id)
-    raw = await file.read()
-    text = raw.decode("utf-8", errors="replace").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="文件内容为空")
-    state.topic = text
-    return {"project_id": project_id, "topic": text, "message": "主题已更新"}
+    async with receive_upload(request) as (form, file):
+        with RESOURCES.acquire():
+            if Path(file.filename or "").suffix.lower() not in (".txt", ".md"):
+                raise HTTPException(400, "主题文件仅支持 .txt 或 .md")
+            raw = await read_bounded(file)
+            try:
+                text = raw.decode("utf-8-sig").strip()
+            except UnicodeDecodeError:
+                raise HTTPException(400, "主题文件不是有效 UTF-8，请转换编码后重试") from None
+            if not text:
+                raise HTTPException(400, "文件内容为空")
+            state.topic = text
+            return {"project_id": project_id, "topic": text, "message": "主题已更新"}
 
 
 # ===== 辅助 =====
 
 
+def _artifact_manager(project_id: str, *, read_only=False):
+    """构造项目级 ArtifactManager（元数据 store + 内容文件 store）。
+
+    此前多处 ArtifactManager(db_path) 少传 content_store，一调用就 TypeError
+    被 except 吞掉，导致方法文档/论文稿永远显示「暂无」。
+    """
+    from core.artifacts import ArtifactContentStore, ArtifactManager
+    store = KnowledgeStore(_CONFIG.paths.project_db(project_id),read_only=read_only)
+    content_store = ArtifactContentStore(_CONFIG.paths.project_artifacts(project_id), read_only=read_only)
+    return ArtifactManager(store, content_store)
+
+
 def _require_project(project_id: str) -> ProjectState:
+    _check_owner(project_id)
     with _LOCK:
+        if project_id not in _PROJECTS and re.fullmatch(r"[A-Za-z0-9_-]{1,120}", project_id):
+            if _CONFIG.paths.project_db(project_id).is_file():
+                _scan_existing_projects()
         state = _PROJECTS.get(project_id)
     if state is None:
         raise HTTPException(
             status_code=404,
             detail=(
                 f"项目不存在: {project_id}"
-                "（若刚重启服务，内存项目列表已丢失，请重新创建项目；"
-                "若访问了错误端口，请确认 8001 单实例）"
+                "。请核对项目编号及当前服务的数据目录；不要通过新建项目覆盖原项目。"
             ),
         )
-        raise HTTPException(status_code=404, detail=f"项目不存在: {project_id}")
+    if not _CONFIG.paths.project_db(project_id).is_file():
+        raise HTTPException(404,"项目数据库不存在，未创建空白数据替代历史项目")
     return state
 
 
 # ===== 静态资源 =====
+
+
+from web.workspace_api import build_workspace_router  # noqa: E402
+from web.conversation_home_api import build_home_router  # noqa: E402
+from web.project_exports_api import build_exports_router  # noqa: E402
+
+
+def _register_conversation_project(pid, topic, domain, created_at):
+    if _AUTH_MODE == "accounts":
+        _ACCOUNT_STORE.claim_new(pid, _active_user())
+    with _LOCK:
+        if pid not in _PROJECTS:
+            store = KnowledgeStore(_CONFIG.paths.project_db(pid),read_only=True)
+            _PROJECTS[pid] = ProjectState(project_id=pid,topic=store.get_kv("research.topic",topic),domain=store.get_kv("project.domain",domain),created_at=created_at,
+                                          display_name=store.get_kv("project.display_name",topic))
+
+
+app.include_router(build_home_router(lambda:_CONFIG,_require_project,_register_conversation_project,
+                                     owner_id=lambda: _active_user() if _AUTH_MODE == "accounts" else None))
+app.include_router(build_exports_router(lambda:_CONFIG, _require_project,
+    lambda state:_workspace_workflow(state,include_materials=True), download_artifact,
+    _make_download, _md_to_docx_response, _md_to_pdf_response))
+
+app.include_router(build_workspace_router(_CONFIG, _require_project,workflow_provider=lambda state:_workspace_workflow(state,include_materials=True)))
+from web.conversation_move_api import build_move_router
+app.include_router(build_move_router(lambda:_CONFIG,_require_project,_check_owner,_active_user,_LOCK))
+
+class _LoginBody(BaseModel):
+    email: str = AuthField(min_length=3, max_length=254)
+    password: str = AuthField(min_length=1, max_length=256)
+
+
+class _RegisterBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    email: str = AuthField(min_length=3, max_length=254)
+    password: str = AuthField(min_length=8, max_length=256)
+    confirm_password: str = AuthField(min_length=8, max_length=256)
+
+
+def _registration_allowed(request: Request) -> bool:
+    return (_AUTH_MODE == "accounts" and os.environ.get("SRA_ALLOW_LOCAL_REGISTRATION") == "1"
+            and request.client is not None and request.client.host in {"127.0.0.1","::1","testclient"}
+            and request.url.hostname in {"127.0.0.1","::1","localhost","testserver"})
+
+
+@app.get("/api/auth/options")
+def auth_options(request: Request):
+    return {"mode":_AUTH_MODE,"registration_enabled":_registration_allowed(request),
+            "min_password_length":MIN_PASSWORD_LENGTH,"max_password_length":MAX_PASSWORD_LENGTH,
+            "email_verification_required":False}
+
+
+@app.post("/api/auth/register", status_code=201)
+def auth_register(body: _RegisterBody, request: Request):
+    if not _registration_allowed(request):
+        raise HTTPException(404,"Not Found")
+    remote = request.client.host if request.client else "unknown"
+    if not _ACCOUNT_STORE.allow_registration_attempt(remote):
+        raise HTTPException(429,"注册尝试过于频繁，请 15 分钟后再试",headers={"Retry-After":"900"})
+    if body.password != body.confirm_password:
+        raise HTTPException(422,"两次密码不一致，请重新核对")
+    try:
+        _ACCOUNT_STORE.create_user(body.email,body.password)
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from None
+    except sqlite3.IntegrityError:
+        raise HTTPException(409,"该邮箱暂时无法注册，请核对或使用已有账号登录") from None
+    return {"created":True,"email_verified":False,"message":"注册成功，邮箱尚未验证。请使用刚设置的密码登录。"}
+
+
+def _auth_view(row):
+    return {"user": {"id": row["id"], "email": row["email"],
+                     "email_verified": False},
+            "csrf_token": row["csrf_token"]}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    if _AUTH_MODE != "accounts":
+        return {"mode": "local"}
+    row = _ACCOUNT_STORE.session(request.cookies.get("sra_session"))
+    if row is None:
+        raise HTTPException(401, "请登录")
+    return _auth_view(row)
+
+
+@app.post("/api/auth/login")
+def auth_login(body: _LoginBody, request: Request, response: Response):
+    if _AUTH_MODE != "accounts":
+        raise HTTPException(404, "Not Found")
+    remote = request.client.host if request.client else "unknown"
+    result = _ACCOUNT_STORE.login(body.email, body.password, remote)
+    if result is None:
+        raise HTTPException(401, "邮箱或密码错误，或尝试过于频繁，请稍后重试")
+    token, csrf, user = result
+    _ACCOUNT_STORE.logout(request.cookies.get("sra_session"))
+    secure = os.environ.get("SRA_AUTH_INSECURE_HTTP") != "1"
+    response.set_cookie("sra_session", token, max_age=SESSION_SECONDS,
+                        httponly=True, secure=secure, samesite="lax", path="/")
+    return {"user": user, "csrf_token": csrf}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response):
+    if _AUTH_MODE != "accounts":
+        raise HTTPException(404, "Not Found")
+    _ACCOUNT_STORE.logout(request.cookies.get("sra_session"))
+    response.delete_cookie("sra_session", path="/", samesite="lax")
+    return {"ok": True}
+
+
+async def account_boundary(request: Request, call_next):
+    """One fail-closed boundary for current and legacy routes, including downloads."""
+    path = request.url.path
+    def denied(code, detail):
+        return JSONResponse({"detail": detail}, status_code=code,
+                            headers={"Cache-Control": "private, no-store", "Vary": "Cookie"})
+    if _AUTH_MODE == "local":
+        # The historical local mode is usable only from a loopback client.
+        if (request.client is None or request.client.host not in {"127.0.0.1", "::1", "testclient"}
+                or request.url.hostname not in {"127.0.0.1", "::1", "localhost", "testserver"}):
+            return denied(403, "本地模式仅允许回环访问")
+        if path.startswith("/api/") and request.method not in {"GET","HEAD","OPTIONS"}:
+            origin = request.headers.get("origin")
+            if ((origin and origin != str(request.base_url).rstrip("/"))
+                    or request.headers.get("sec-fetch-site") == "cross-site"):
+                return denied(403, "本地演示不接受其他网站提交的修改请求")
+        return await call_next(request)
+    if os.environ.get("SRA_AUTH_INSECURE_HTTP") == "1" and (
+        request.client is None or request.client.host not in {"127.0.0.1", "::1", "testclient"}
+        or request.url.hostname not in {"127.0.0.1", "::1", "localhost", "testserver"}
+    ):
+        return denied(403, "开发 HTTP 模式仅允许回环访问")
+    # No other path may serve files from the project root; static is code only.
+    if path.startswith("/api/"):
+        origin = request.headers.get("origin")
+        if origin and origin != str(request.base_url).rstrip("/"):
+            return denied(403, "跨站请求已拒绝")
+        if request.headers.get("sec-fetch-site") == "cross-site":
+            return denied(403, "跨站请求已拒绝")
+        public_writes = {"/api/auth/login", "/api/auth/register"}
+        if path in public_writes and request.method == "POST" and request.headers.get("x-sra-login") != "1":
+            return denied(403, "请求校验失败，请刷新后重试")
+        row = _ACCOUNT_STORE.session(request.cookies.get("sra_session"))
+        public_auth = path in {"/api/auth/login", "/api/auth/register", "/api/auth/me", "/api/auth/options"}
+        if row is None and not public_auth:
+            return denied(401, "请重新登录")
+        # A stale page must not start reading a newly logged-in account through
+        # the browser's shared cookie. The header binds fetches to its session.
+        if row and path not in public_writes and request.headers.get("x-sra-csrf") is not None:
+            if not hmac.compare_digest(request.headers["x-sra-csrf"].encode(), row["csrf_token"].encode()):
+                return denied(401 if request.method in {"GET", "HEAD"} else 403,
+                              "登录状态已变化，请重新登录")
+        if row and request.method not in {"GET", "HEAD", "OPTIONS"} and path not in public_writes:
+            supplied = request.headers.get("x-sra-csrf", "")
+            if not hmac.compare_digest(supplied.encode(), row["csrf_token"].encode()):
+                return denied(403, "请求校验失败，请刷新后重试")
+        match = None if path == "/api/projects/batch-delete" else re.match(
+            r"^/api/projects/([^/]+)(?:/|$)", path)
+        if match and (not re.fullmatch(r"[A-Za-z0-9_-]{1,120}",match.group(1)) or
+                      row is None or not _ACCOUNT_STORE.owns(match.group(1), row["id"])):
+            return denied(404, "项目不存在")
+        token = _CURRENT_USER.set(row["id"] if row else None)
+        resource_actor = ACTOR.set(row["id"] if row else "unauthenticated")
+        try:
+            response = await call_next(request)
+        finally:
+            _CURRENT_USER.reset(token)
+            ACTOR.reset(resource_actor)
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Vary"] = "Cookie"
+        return response
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def teaching_execution_boundary(request, call_next):
+    """Old execution/import endpoints cannot turn a saved lesson into live work."""
+    import re
+    from fastapi.responses import JSONResponse
+    from core.workspace.conversations import ConversationService
+    from core.workspace.teaching import teaching_identity
+    match = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/(.+)$", request.url.path)
+    if request.method in ("POST", "PUT") and match and (
+        _AUTH_MODE == "local" or (
+            (session := _ACCOUNT_STORE.session(request.cookies.get("sra_session"))) is not None
+            and _ACCOUNT_STORE.owns(match.group(1), session["id"])
+        )
+    ):
+        pid, tail = match.groups()
+        blocked = tail in {"run", "resume", "run-topic-discovery", "regenerate-method-doc", "human-response", "papers/import", "upload-paper", "upload-topic", "workspace/guide"} or "research-tasks" in tail
+        db = _CONFIG.paths.project_db(pid)
+        if blocked and db.is_file():
+            try:
+                if teaching_identity(ConversationService(pid, db)):
+                    return JSONResponse(status_code=422, content={"detail": "教学体验不执行实时检索、生成或实验。请明确转为自己的普通研究后操作。"})
+            except ValueError:
+                pass  # The owning endpoint reports storage/ownership errors.
+    return await call_next(request)
+
+
+# Last added is outermost: identity/CSRF must run before any middleware reads
+# a project, including the historical teaching execution guard.
+app.middleware("http")(account_boundary)
+
+
+@app.exception_handler(CapacityError)
+async def resource_capacity_error(request, exc):
+    return JSONResponse(status_code=429, content={"detail": str(exc), "reason_code": exc.code,
+        "retryable": True, "retry_after_seconds": 5},
+        headers={"Retry-After": "5", "Cache-Control": "private, no-store"})
+
+
+@app.get("/api/resource-limits")
+def resource_limits():
+    limits = RESOURCES.limits
+    return {"heavy_per_user": limits.heavy_user, "heavy_global": limits.heavy_global,
+            "upload_file_bytes": limits.file_bytes, "upload_request_bytes": limits.body_bytes,
+            "upload_max_files": 1, "upload_max_fields": 2, "upload_field_bytes": limits.field_bytes,
+            "queue": False}
+
+
+@app.get("/workspace")
+def research_workspace() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @app.get("/")
@@ -3216,7 +4272,7 @@ def index() -> FileResponse:
 
 @app.get("/api/data-sources")
 def list_data_sources() -> dict:
-    """外部数据源合规登记（赛题 §5.3 支撑）。
+    """外部数据源合规登记。
 
     数据源元信息集中登记在 `core/tools/data_provenance.py`，
     本端点暴露给前端 dashboard 的"数据源合规性"卡片。
@@ -3232,8 +4288,12 @@ def list_data_sources() -> dict:
 def static_files(file_path: str) -> FileResponse:
     """静态资源（强制 no-cache，避免前端更新后用户仍看到旧版缓存导致样式错乱）。"""
     target = (STATIC_DIR / file_path).resolve()
-    if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.is_file():
+    if not target.is_relative_to(STATIC_DIR.resolve()) or not target.is_file():
         raise HTTPException(status_code=404, detail="Not Found")
+    if target == (STATIC_DIR / "workspace.html").resolve():
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/workspace", status_code=307,
+                                headers={"Cache-Control":"no-store"})
     return FileResponse(
         target,
         headers={
@@ -3242,8 +4302,8 @@ def static_files(file_path: str) -> FileResponse:
             "Expires": "0",
         },
     )
-# 挂载静态目录（/static/...）
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+# The checked route above is the only static-file entry; project directories
+# and the legacy workspace shell are never exposed through a fallback mount.
 
 
 if __name__ == "__main__":
@@ -3251,4 +4311,7 @@ if __name__ == "__main__":
 
     # 优先取 SRA_WEB_PORT；Render/Fly 等 PaaS 注入 $PORT 时兼容使用
     port = int(os.environ.get("SRA_WEB_PORT") or os.environ.get("PORT") or "8001")
-    uvicorn.run("web.api:app", host="0.0.0.0", port=port, reload=False)
+    host = os.environ.get("SRA_WEB_HOST", "127.0.0.1")
+    if _AUTH_MODE == "local" and host not in {"127.0.0.1", "::1", "localhost"}:
+        raise RuntimeError("本地单用户模式必须绑定回环地址")
+    uvicorn.run("web.api:app", host=host, port=port, reload=False)
