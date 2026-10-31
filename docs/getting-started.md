@@ -13,7 +13,7 @@
 **第一步：下载代码并创建独立环境。**
 
 ```bash
-git clone --branch codex/local-release-20261101 https://github.com/weimeng09280929/scientificResearchAgentSys.git
+git clone https://github.com/weimeng09280929/scientificResearchAgentSys.git
 cd scientificResearchAgentSys
 python -m venv venv
 ```
@@ -116,7 +116,7 @@ python -m tools.serve_local --mode accounts --port 8077 --allow-registration
 请帮我安装 Scientific Agent：
 https://github.com/weimeng09280929/scientificResearchAgentSys
 
-当前新版分支：codex/local-release-20261101（尚未合入 main）。
+使用默认 main 分支中的最新发布版本。
 
 1. 先检查当前目录、Python 版本及是否已有仓库；已有代码则保留改动，
    不要覆盖文件、删除数据或强制重置 Git。
