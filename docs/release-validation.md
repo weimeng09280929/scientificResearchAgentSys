@@ -37,4 +37,6 @@ python -m pytest -q -p no:cacheprovider -p tests.resource_offline_guard tests/te
 
 发布运行源码、静态资源及第三方许可证、教学数据、可复现的测试源码、配置模板和面向用户的文档。`.env`、账号与项目数据库、私人论文、备份、运行日志、内部交付报告和验收截图留在本机。首页配图只作界面示意，不是最新功能的质量证明。
 
-目标仓库为 `weimeng09280929/scientificResearchAgentSys`。本地工作分支与远端 `main` 历史已分叉，因此通过独立的 `codex/` 分支提交本地发布快照并提出合并请求；不强制推送、不替换远端默认分支，也不切换或清理原开发工作区。快照基于远端 `main` 建立，业务文件来自本地当前版本；合并前可通过合并请求查看全部差异。
+目标仓库为 `weimeng09280929/scientificResearchAgentSys`。本地工作分支与远端 `main` 历史已分叉，因此通过独立的 `codex/local-release-20261101` 分支提交本地发布快照，供合并前审阅；不强制推送、不替换远端默认分支，也不切换或清理原开发工作区。快照基于远端 `main` 建立，业务文件来自本地当前版本；合并前可通过分支比较查看全部差异。
+
+分支已推送。GitHub 连接器创建合并请求返回 403（Resource not accessible by integration），本机无 GitHub CLI，因此本次未创建或合并 PR；这不影响已推送的源码和 README。可在仓库比较 `main...codex/local-release-20261101` 后创建合并请求。

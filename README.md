@@ -8,6 +8,8 @@ Scientific Agent 是面向理工科科研新手的 AI 协作工作台。你可�
 
 [安装与配置](docs/getting-started.md) · [使用指南](docs/user-guide.md) · [当前版本与边界](docs/current-status.md)
 
+本次源码更新位于 `codex/local-release-20261101` 分支，尚未合入 `main`；安装本版请使用安装指南中的指定分支命令。
+
 ![Scientific Agent 中央科研对话工作台](docs/images/workbench.png)
 
 ## 你可以怎样使用它
